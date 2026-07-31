@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+# Артефакты оффлайн-прогонов (tools/record.py, tools/replay.py, run_on_video.py)
+run_output/
+records/
+*.log
+
+# Записи попыток и журналы хаба: их место в облаке команды, а не в git
+flight_*.mp4
+flight_*.jsonl
+hub_log.jsonl
+
+# Отчёты диагностики борта — результат переносится в config.yaml руками
+tools/check_sdk_report.txt
+tools/check_axes_report.txt
+tools/check_sdk_frame.png
+
+# Редакторы и ОС
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# PDF держим только в source/ — в корень они попадают из загрузок случайно
+/*.pdf
+
+# Фотографии с площадки: в корень попадают из мессенджера, в репозиторий не идут
+# (картинки к документам живут в docs/assets/ и добавляются осознанно)
+/*.jpg
+/*.jpeg
+/*.png
