@@ -1,0 +1,40 @@
+# ── Тяжёлые видео (хранятся локально / в бэкапе, не в git) ──
+*.mp4
+*.mov
+*.m4v
+*.avi
+_source_video/
+recovered_video/
+
+# ── Python / окружение ──
+.venv/
+__pycache__/
+*.pyc
+
+# ── Обучение: веса, прогоны, собранный датасет (пересобираются) ──
+runs/
+*.pt
+*.onnx
+*.rknn
+# ИСКЛЮЧЕНИЕ: модели, вложенные в стабильные снапшоты, ДОЛЖНЫ быть в гите —
+# чтобы каждая stable_vX.Y была самодостаточна для отката (код + своя нейросеть).
+!stable_v*/*.rknn
+# training/dataset/ пересобирается из training/images_to_label/ скриптом build_dataset.py
+training/dataset/
+# Исходные снимки для разметки (~494 МБ) — хранятся локально / в бэкапе, не в git
+training/images_to_label/
+# Кадры, нарезанные из видео (~100 МБ) — регенерируются из исходных видео
+training/frames/
+
+# ── RKNN-конвертация: калибровка и промежуточные артефакты ──
+rknn_convert/calib/
+rknn_convert/dataset.txt
+rknn_convert/check*.onnx
+rknn_convert/test_boat*.png
+
+# ── Временные выгрузки с дрона (регенерируются по scp) ──
+drone_logs/
+drone_pull/
+
+# ── Логи ──
+*.log

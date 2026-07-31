@@ -1,0 +1,180 @@
+import sys
+import time
+import threading
+import cv2
+import numpy as np
+
+wait_time = 30
+
+# Импорт SDK
+try:
+    from pioneer_sdk2 import Pioneer, Camera, ImageViewer, CameraType
+except ImportError:
+    print("Ошибка: Не удалось импортировать pioneer_sdk2. Убедитесь, что библиотека установлена.")
+    sys.exit(1)
+
+# Глобальные флаги для управления потоками
+stop_video_thread = False
+
+
+def video_worker(cam_main, cam_opt, viewer):
+    global stop_video_thread
+    while not stop_video_thread:
+        try:
+            if cam_main and viewer:
+                frame_main = cam_main.get_cv_frame()
+                if frame_main is not None:
+                    viewer.imshow(name='main_camera', frame=frame_main)
+
+            if cam_opt and viewer:
+                frame_opt = cam_opt.get_cv_frame()
+                if frame_opt is not None:
+                    viewer.imshow(name='additional_camera', frame=frame_opt)
+
+            time.sleep(0.03)
+        except Exception as e:
+            pass
+
+
+def hover_with_countdown(pioneer, total_wait_time, label=""):
+    """Зависание над точкой с обратным отсчётом в терминале."""
+    print(f"{label}Ожидание {total_wait_time} секунд...")
+
+    start_time = time.time()
+    end_time = start_time + total_wait_time
+
+    while time.time() < end_time:
+        remaining = int(end_time - time.time())
+        if remaining < 0:
+            remaining = 0
+
+        sys.stdout.write(f"\r{label}Осталось времени до конца sleep: {remaining} сек   ")
+        sys.stdout.flush()
+
+        time.sleep(1)
+
+    print(f"\n{label}Время ожидания истекло.")
+
+
+def main():
+    global stop_video_thread
+
+    pioneer = None
+    iv = None
+    cam_main_obj = None
+    cam_opt_obj = None
+    video_thread = None
+
+    try:
+        # Инициализация дрона и камер
+        pioneer = Pioneer()
+
+        # Инициализация камер
+        cam_main_obj = Camera(camera_type=CameraType.MAIN)
+        cam_opt_obj = Camera(camera_type=CameraType.OPT)
+
+        # Инициализация просмотра
+        iv = ImageViewer()
+
+        print("Начало программы")
+
+        # Запуск потока видео
+        stop_video_thread = False
+        video_thread = threading.Thread(
+            target=video_worker,
+            args=(cam_main_obj, cam_opt_obj, iv),
+            daemon=True
+        )
+        video_thread.start()
+        print("Поток вывода видео запущен")
+
+        time.sleep(0.5)
+
+        # Взлет
+        pioneer.arm()
+        print("Дрон заармлен")
+
+        pioneer.takeoff()
+        print("Дрон взлетел")
+
+        # ======================== ТОЧКА 1 ========================
+        print("Дрон двигается к точке 1")
+        pioneer.go_to_local_point(-1.8, 1.9, 2.55, 0, 5)
+
+        while not pioneer.point_reached():
+            time.sleep(0.1)
+
+        print("Дрон висит над точкой 1")
+        hover_with_countdown(pioneer, wait_time, label="[Точка 1] ")
+
+        # ======================== ТОЧКА 2 ========================
+        print("Дрон двигается к точке 2")
+        pioneer.go_to_local_point(-1.8, 0.9, 2.55, 0, 5)
+
+        while not pioneer.point_reached():
+            time.sleep(0.1)
+
+        print("Дрон висит над точкой 2")
+        hover_with_countdown(pioneer, wait_time, label="[Точка 2] ")
+
+        # ======================== ПОСАДКА ========================
+        print("Дрон направляется на посадку")
+        pioneer.go_to_local_point(0, 0, 0.3, 0, 5)
+
+        while not pioneer.point_reached():
+            time.sleep(0.1)
+
+        print("Дрон садится")
+        pioneer.land()
+
+        time.sleep(2)
+
+        pioneer.disarm()
+        print("Дрон дизармлен")
+
+    except KeyboardInterrupt:
+        print("\nПрервано пользователем (Ctrl+C)")
+    except Exception as e:
+        print(f"Произошла ошибка: {e}")
+    finally:
+        print("Завершение работы и очистка ресурсов...")
+
+        # Останавливаем поток видео
+        stop_video_thread = True
+        if video_thread is not None:
+            video_thread.join(timeout=2.0)
+
+        # Безопасная остановка дрона
+        if pioneer is not None:
+            try:
+                pioneer.wait_callback = False
+                try:
+                    pioneer.land()
+                    time.sleep(1)
+                except:
+                    pass
+                pioneer.disarm()
+                pioneer.close_connection()
+            except Exception as e:
+                print(f"Ошибка при закрытии соединения с дроном: {e}")
+
+        # Остановка камер
+        for cam_name, cam_obj in [("cam_main", cam_main_obj), ("cam_opt", cam_opt_obj)]:
+            if cam_obj is not None:
+                try:
+                    cam_obj.stop()
+                except Exception:
+                    pass
+
+        # Закрытие viewer
+        if iv is not None:
+            try:
+                iv.close()
+            except Exception:
+                pass
+
+        print("Конец программы")
+
+
+if __name__ == "__main__":
+    main()

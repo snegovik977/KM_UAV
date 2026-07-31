@@ -1,0 +1,259 @@
+import sys
+import time
+import threading
+import cv2
+import numpy as np
+import os
+
+wait_time = 15
+
+# Импорт SDK
+try:
+    from pioneer_sdk2 import Pioneer, Camera, ImageViewer, CameraType
+except ImportError:
+    print("Ошибка: Не удалось импортировать pioneer_sdk2. Убедитесь, что библиотека установлена.")
+    sys.exit(1)
+
+# Глобальные переменные для записи видео
+stop_video_thread = False
+video_writer = None
+is_recording = False
+recording_filename = ""
+
+
+def init_video_recorder(camera, output_dir="/home/pioneermini/workspace"):
+    """Инициализирует VideoWriter и возвращает его."""
+    global video_writer, recording_filename
+
+    print("📷 Инициализация записи видео...")
+    first_frame = camera.get_cv_frame()
+
+    if first_frame is None:
+        raise Exception("Не удалось получить кадр с камеры для инициализации записи.")
+
+    height, width = first_frame.shape[:2]
+    fps = 30
+
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir)
+        print(f" Создана папка: {output_dir}")
+
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    recording_filename = os.path.join(output_dir, f"flight_record_{timestamp}.mp4")
+
+    writer = cv2.VideoWriter(
+        recording_filename,
+        cv2.VideoWriter_fourcc(*'mp4v'),
+        fps,
+        (width, height)
+    )
+
+    if not writer.isOpened():
+        raise Exception("Не удалось открыть VideoWriter.")
+
+    print(f"🎥 Запись начата: {recording_filename} ({width}x{height}, {fps} FPS)")
+    return writer, recording_filename
+
+
+def video_worker(cam_main, cam_opt, viewer):
+    global stop_video_thread, video_writer, is_recording
+
+    while not stop_video_thread:
+        try:
+            if cam_main and viewer:
+                frame_main = cam_main.get_cv_frame()
+                if frame_main is not None:
+                    viewer.imshow(name='main_camera', frame=frame_main)
+
+                    if is_recording and video_writer is not None:
+                        video_writer.write(frame_main)
+
+            if cam_opt and viewer:
+                frame_opt = cam_opt.get_cv_frame()
+                if frame_opt is not None:
+                    viewer.imshow(name='additional_camera', frame=frame_opt)
+
+            time.sleep(0.03)
+        except Exception as e:
+            pass
+
+
+def hover_with_countdown(pioneer, total_wait_time, label=""):
+    """Зависание над точкой с обратным отсчётом."""
+    print(f"{label}Ожидание {total_wait_time} секунд...")
+
+    start_time = time.time()
+    end_time = start_time + total_wait_time
+
+    while time.time() < end_time:
+        remaining = int(end_time - time.time())
+        if remaining < 0:
+            remaining = 0
+
+        sys.stdout.write(f"\r{label}Осталось времени до конца sleep: {remaining} сек   ")
+        sys.stdout.flush()
+
+    print(f"\n{label}Время ожидания истекло.")
+
+
+def go_to_point(pioneer, x, y, z, yaw, speed, label=""):
+    """Перемещение в точку с ожиданием достижения."""
+    print(f"{label}Дрон двигается к точке ({x}, {y}, {z})")
+    pioneer.go_to_local_point(x, y, z, yaw, speed)
+
+    while not pioneer.point_reached():
+        time.sleep(0.1)
+
+    print(f"{label}Дрон достиг точки ({x}, {y}, {z})")
+
+
+def main():
+    global stop_video_thread, video_writer, is_recording, recording_filename
+
+    pioneer = None
+    iv = None
+    cam_main_obj = None
+    cam_opt_obj = None
+    video_thread = None
+
+    # Координаты точек из схемы
+    POINTS = {
+        "0": {"x": 0, "y": 3.0, "z": 1.5, "yaw": 0, "speed": 5, "hover": False, "label": "[Точка 0]"},
+        "1": {"x": -1.8, "y": 3.0, "z": 2, "yaw": 0, "speed": 5, "hover": True, "label": "[Точка 1]"},
+        "2": {"x": -2.3, "y": 3.0, "z": 2, "yaw": 0, "speed": 5, "hover": True, "label": "[Точка 2]"},
+        "3": {"x": -2.3, "y": 1.8, "z": 2, "yaw": 0, "speed": 5, "hover": True, "label": "[Точка 3]"},
+        "4": {"x": -1.8, "y": 1.8, "z": 2, "yaw": 0, "speed": 5, "hover": True, "label": "[Точка 4]"},
+        "5": {"x": 0, "y": 1.8, "z": 1, "yaw": 0, "speed": 5, "hover": False, "label": "[Точка 5]"},
+        "6a": {"x": 0, "y": -0.1, "z": 0.5, "yaw": 0, "speed": 5, "hover": False, "label": "[Точка 6 - Снижение 1]"},
+        "6b": {"x": 0, "y": -0.1, "z": 0.25, "yaw": 0, "speed": 5, "hover": False, "label": "[Точка 6 - Снижение 2]"},
+        "6c": {"x": 0, "y": -0.1, "z": 0.1, "yaw": 0, "speed": 5, "hover": False, "label": "[Точка 6 - Снижение 3]"},
+    }
+
+    # Порядок обхода точек
+    FLIGHT_ORDER = ["0", "1", "2", "3", "4", "5", "6a", "6b", "6c"]
+
+    try:
+        # Инициализация дрона и камер
+        pioneer = Pioneer()
+        cam_main_obj = Camera(camera_type=CameraType.MAIN)
+        cam_opt_obj = Camera(camera_type=CameraType.OPT)
+        iv = ImageViewer()
+
+        print("Начало программы")
+
+        # Инициализация записи видео ДО взлета
+        try:
+            video_writer, recording_filename = init_video_recorder(cam_main_obj)
+            is_recording = True
+        except Exception as e:
+            print(f"️ Не удалось начать запись видео: {e}. Полет продолжится без записи.")
+            is_recording = False
+
+        # Запуск потока видео
+        stop_video_thread = False
+        video_thread = threading.Thread(
+            target=video_worker,
+            args=(cam_main_obj, cam_opt_obj, iv),
+            daemon=True
+        )
+        video_thread.start()
+        print("Поток вывода видео запущен")
+
+        time.sleep(0.5)
+
+        # Взлет
+        pioneer.arm()
+        print("Дрон заармлен")
+        time.sleep(3)
+        pioneer.takeoff()
+        print("Дрон взлетел")
+        time.sleep(3)
+        print("Проверка фиксации локальных координат")
+
+        # ======================== ПРОЛЁТ ПО ТОЧКАМ ========================
+        for point_key in FLIGHT_ORDER:
+            point = POINTS[point_key]
+            go_to_point(
+                pioneer,
+                x=point["x"],
+                y=point["y"],
+                z=point["z"],
+                yaw=point["yaw"],
+                speed=point["speed"],
+                label=point["label"]
+            )
+
+            # Удержание на точках 1-4
+            if point["hover"]:
+                hover_with_countdown(pioneer, wait_time, label=point["label"])
+
+        # ======================== ПОСАДКА ========================
+        print("Дрон садится")
+        pioneer.land()
+        time.sleep(2)
+
+        pioneer.disarm()
+        print("Дрон дизармлен")
+
+    except KeyboardInterrupt:
+        print("\nПрервано пользователем (Ctrl+C)")
+    except Exception as e:
+        print(f"Произошла ошибка: {e}")
+        import traceback
+        traceback.print_exc()
+    finally:
+        print("Завершение работы и очистка ресурсов...")
+
+        # Останавливаем запись видео
+        is_recording = False
+        if video_writer is not None:
+            print("💾 Сохранение видеофайла...")
+            video_writer.release()
+            if recording_filename:
+                try:
+                    file_size = os.path.getsize(recording_filename)
+                    print(f"✅ Видео сохранено: {recording_filename} ({round(file_size / 1024 / 1024, 2)} MB)")
+                except:
+                    print(f"✅ Видео сохранено: {recording_filename}")
+            video_writer = None
+
+        # Останавливаем поток видео
+        stop_video_thread = True
+        if video_thread is not None:
+            video_thread.join(timeout=2.0)
+
+        # Безопасная остановка дрона
+        if pioneer is not None:
+            try:
+                pioneer.wait_callback = False
+                try:
+                    if not pioneer.is_landed():
+                        pioneer.land()
+                        time.sleep(1)
+                except:
+                    pass
+                pioneer.disarm()
+                pioneer.close_connection()
+            except Exception as e:
+                print(f"Ошибка при закрытии соединения с дроном: {e}")
+
+        # Остановка камер
+        for cam_name, cam_obj in [("cam_main", cam_main_obj), ("cam_opt", cam_opt_obj)]:
+            if cam_obj is not None:
+                try:
+                    cam_obj.stop()
+                except Exception:
+                    pass
+
+        # Закрытие viewer
+        if iv is not None:
+            try:
+                iv.close()
+            except Exception:
+                pass
+
+        print("Конец программы")
+
+
+if __name__ == "__main__":
+    main()

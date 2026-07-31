@@ -1,0 +1,119 @@
+import sys
+import time
+import threading
+import cv2
+import numpy as np
+
+# Импорт SDK
+try:
+    from pioneer_sdk2 import Pioneer, Camera, ImageViewer, CameraType
+except ImportError:
+    print("Ошибка: Не удалось импортировать pioneer_sdk2. Убедитесь, что библиотека установлена.")
+    sys.exit(1)
+
+# Глобальные флаги для управления потоками
+stop_video_thread = False
+
+
+def video_worker(cam_main, cam_opt, viewer):
+    global stop_video_thread
+    while not stop_video_thread:
+        try:
+            if cam_main and viewer:
+                frame_main = cam_main.get_cv_frame()
+                if frame_main is not None:
+                    viewer.imshow(name='main_camera', frame=frame_main)
+
+            if cam_opt and viewer:
+                frame_opt = cam_opt.get_cv_frame()
+                if frame_opt is not None:
+                    viewer.imshow(name='additional_camera', frame=frame_opt)
+
+            time.sleep(0.03)
+        except Exception as e:
+            pass
+
+
+def main():
+    global stop_video_thread
+
+    iv = None
+    cam_main_obj = None
+    cam_opt_obj = None
+    video_thread = None
+
+    try:
+        # Инициализация камер
+        cam_main_obj = Camera(camera_type=CameraType.MAIN)
+        cam_opt_obj = Camera(camera_type=CameraType.OPT)
+
+        # Инициализация просмотра
+        iv = ImageViewer()
+
+        print("Начало программы")
+
+        # Запуск потока видео
+        stop_video_thread = False
+        video_thread = threading.Thread(
+            target=video_worker,
+            args=(cam_main_obj, cam_opt_obj, iv),
+            daemon=True  # Поток завершится автоматически при завершении основной программы
+        )
+        video_thread.start()
+        print("Поток вывода видео запущен")
+
+        time.sleep(0.5)
+
+        # Ожидание 5 минут (300 секунд)
+        total_wait_time = 300
+        print(f"Вывод изображения с камер в течение {total_wait_time} секунд...")
+
+        start_time = time.time()
+        end_time = start_time + total_wait_time
+
+        while time.time() < end_time:
+            remaining = int(end_time - time.time())
+            if remaining < 0:
+                remaining = 0
+
+            # Вывод времени в терминал (обновление одной строки)
+            sys.stdout.write(f"\rОсталось времени до конца программы: {remaining} сек   ")
+            sys.stdout.flush()
+
+            # Ждем 1 секунду перед следующим обновлением таймера
+            time.sleep(1)
+
+        print("\nВремя ожидания истекло.")
+
+    except KeyboardInterrupt:
+        print("\nПрервано пользователем (Ctrl+C)")
+    except Exception as e:
+        print(f"Произошла ошибка: {e}")
+    finally:
+        print("Завершение работы и очистка ресурсов...")
+
+        # Останавливаем поток видео
+        stop_video_thread = True
+        if video_thread is not None:
+            video_thread.join(timeout=2.0)  # Ждем завершения потока не более 2 секунд
+
+        # Остановка камер
+        for cam_name, cam_obj in [("cam_main", cam_main_obj), ("cam_opt", cam_opt_obj)]:
+            if cam_obj is not None:
+                try:
+                    cam_obj.stop()
+                except Exception:
+                    pass
+
+        # Закрытие viewer
+        if iv is not None:
+            try:
+                iv.close()
+            except Exception:
+                pass
+
+        print("Конец программы")
+
+
+if __name__ == "__main__":
+    main()

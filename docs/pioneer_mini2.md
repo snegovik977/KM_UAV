@@ -3,6 +3,10 @@
 Источник: https://docs.geoscan.ru/pioneer/instructions/pioneer-mini2/main-mini2.html
 Собрано: 2026-07-31. Ниже — только то, что нужно для проекта CV на борту БПЛА.
 
+> ⚠️ Раздатка организаторов расходится с этим документом по нескольким пунктам
+> (порт `ImageViewer`, оси `go_to_local_point`, имя метода дальномера) —
+> см. [organizer_handouts.md](organizer_handouts.md) §1 и §3.
+
 ---
 
 ## 1. Что это за аппарат

@@ -1,0 +1,21 @@
+# Датасет для дообучения YOLOv8n — обнаружение корабликов
+#
+# Куда класть данные (структуру создать рядом с этим файлом):
+#   training/dataset/images/train/*.jpg   +   training/dataset/labels/train/*.txt
+#   training/dataset/images/val/*.jpg     +   training/dataset/labels/val/*.txt
+#
+# Формат метки (YOLO), одна строка на объект:
+#   <class> <x_center> <y_center> <width> <height>   — всё нормировано 0..1
+# Имя txt-файла = имя картинки (image1.jpg -> image1.txt)
+#
+# ВАЖНО: сплит train/val делать ПО КЛИПАМ, а не по кадрам,
+# иначе почти одинаковые кадры протекут в val и метрика соврёт.
+
+path: /Users/username/Documents/Work/water_object_monitoring_archipelago_2026/training/dataset
+train: images/train
+val: images/val
+
+nc: 2
+names:
+  0: registered      # зелёные накладки/носовой треугольник — зарегистрирован
+  1: unregistered    # оранжевые — не зарегистрирован
