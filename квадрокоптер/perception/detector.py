@@ -448,6 +448,13 @@ class YoloRknnDetector(object):
         self._log = log or (lambda text: print(text))
         self.img_size = int(img_size)
         self.labels = tuple(labels)
+        if len(self.labels) < 2:
+            # Ветки RKNN опознаются по числу каналов, а классовая ветка при одном
+            # классе имеет 1 канал — ровно как служебная score-sum. Различить их
+            # нельзя, и декодер возьмёт не ту: боксы получатся из шума, без ошибок.
+            self._log("[детектор] ВНИМАНИЕ: у модели один класс (%s). Классовая ветка "
+                      "неотличима от score-sum по числу каналов — обучайте минимум "
+                      "на два класса (docs/YOLO_TRAINING.md §6)" % (self.labels,))
         try:
             self._model = _собрать_модель(model_name, float(conf), float(nms_thresh),
                                           len(self.labels), self.img_size, self._log)
@@ -499,14 +506,21 @@ def create_detector(cfg, log=None):
                          % (BACKENDS, backend))
 
     if backend == "yolo":
+        # Классы берутся из конфига, а не из константы LABELS: их число обязано
+        # совпадать с обученной моделью (training/classes.txt), иначе декодер
+        # разложит сырые ветки не по тем каналам — молча.
+        строка_меток = str(раздел.get("labels", ",".join(LABELS)))
+        метки = tuple(ч.strip() for ч in строка_меток.split(",") if ч.strip()) or LABELS
         try:
             детектор = YoloRknnDetector(
                 model_name=str(раздел.get("model", "stations")),
                 conf=float(раздел.get("conf", 0.25)),
                 nms_thresh=float(раздел.get("nms", 0.45)),
                 img_size=int(раздел.get("img_size", 640)),
+                labels=метки,
                 log=log)
-            log("[детектор] YOLO на NPU: модель %r" % раздел.get("model", "stations"))
+            log("[детектор] YOLO на NPU: модель %r, классы %s"
+                % (раздел.get("model", "stations"), ", ".join(метки)))
             return детектор
         except (DetectorUnavailable, ImportError) as e:
             log("[детектор] ВНИМАНИЕ: %s" % e)

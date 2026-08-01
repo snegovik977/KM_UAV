@@ -219,10 +219,14 @@ def main():
             if not свой.start():
                 свой = None
 
+        писать_сырое = bool(cfg.get_path("mission.record_raw", True))
         if args.record:
             from record import RecordWriter
             recorder = RecordWriter(out_dir=str(cfg["mission"]["record_dir"]),
                                     fps=float(cfg["mission"]["record_fps"]), log=log)
+            log("[handheld] пишу %s кадр"
+                % ("сырой (годен для обучения)" if писать_сырое
+                   else "С РАЗМЕТКОЙ — для обучения модели такие кадры НЕ годятся"))
 
         имя_потока = str(cfg["camera"]["viewer_name"])
         таймаут = float(cfg["camera"]["frame_timeout"])
@@ -285,6 +289,10 @@ def main():
                                        rejected=отвергнутые)
 
             # ---------------------------------------------------------- отрисовка
+            # Копия ДО отрисовки: этим инструментом снимают датасет для обучения
+            # (docs/YOLO_TRAINING.md §2), а рамки и подписи в кадре сеть выучит как
+            # признак станции. Ключ тот же, что у main.py — mission.record_raw.
+            сырой = frame.copy() if (recorder is not None and писать_сырое) else None
             перцепция.draw(frame, детекции)
             for детекция, причина, число in отвергнутые:
                 x1, y1, x2, y2 = детекция.bbox
@@ -299,11 +307,15 @@ def main():
             ])
             _показать(viewer, свой, имя_потока, frame)
             if recorder is not None:
-                recorder.frame(frame)
-                recorder.event({"t": time.time(), "state": SURVEY,
-                                "position": [0.0, 0.0, высота],
-                                "roll": углы[0], "pitch": углы[1], "yaw": углы[2],
-                                "origin": [0.0, 0.0, 0.0], "frame": кадров})
+                recorder.frame(сырой if сырой is not None else frame)
+                # telemetry, а не event: у RecordWriter метода event нет, и вызов
+                # ронял инструмент на первом же кадре с --record. Ключи t и frame
+                # проставляет сам RecordWriter — по ним replay совмещает видео
+                # с телеметрией.
+                recorder.telemetry({"state": SURVEY,
+                                    "position": [0.0, 0.0, высота],
+                                    "roll": углы[0], "pitch": углы[1], "yaw": углы[2],
+                                    "origin": [0.0, 0.0, 0.0]})
 
             # ------------------------------------------------------------- отчёт
             if args.quiet or time.time() - печатали < args.every:

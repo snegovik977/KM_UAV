@@ -18,6 +18,34 @@ flight_*.mp4
 flight_*.jsonl
 hub_log.jsonl
 
+# Обучение модели (docs/YOLO_TRAINING.md). В git идут КОД конвейера, classes.txt,
+# списки клипов, разметка (.txt — она дорогая по времени и весит килобайты)
+# и веса (.pt/.rknn): на площадке может не быть интернета, чтобы что-то докачать.
+# ⚠️ Комментарии здесь только на отдельных строках: git трактует «путь # текст»
+# как путь целиком, вместе с решёткой, и правило молча перестаёт работать.
+
+# своё окружение обучения
+training/.venv/
+# клон форка airockchip, восстанавливается одним git clone
+training/vendor/
+# КАДРЫ датасета — сотни мегабайт, их место в облаке команды; .txt рядом остаются
+training/images_to_label/**/*.jpg
+training/images_to_label/**/*.jpeg
+training/images_to_label/**/*.png
+training/images_to_label/**/*.bmp
+# пересобирается build_dataset.py за секунды
+training/dataset/
+# логи и чекпойнты обучения; нужный best.pt копировать в training/weights/ руками
+training/runs/
+# картинки check_model.py
+training/предсказания/
+# калибровочные кадры — копии train-набора
+training/rknn/calib/
+training/rknn/dataset.txt
+# рабочая копия ONNX для контейнера; сам ONNX воспроизводится export_onnx.py
+training/rknn/best.onnx
+*.onnx
+
 # Отчёты диагностики борта — результат переносится в config.yaml руками
 tools/check_sdk_report.txt
 tools/check_axes_report.txt

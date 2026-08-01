@@ -424,6 +424,28 @@ python tools/eval_detection.py кадры\ разметка\
 Отдельно выделяется путаница `ok ↔ dust`: она стоит и 5 баллов подзадачи 2.3.3,
 и наведения в 2.3.4 — обдувать будут не ту станцию.
 
+### 6.3 Обучить модель по записям
+
+Из тех же записей режется датасет для YOLO. Полная инструкция —
+[docs/YOLO_TRAINING.md](docs/YOLO_TRAINING.md), здесь только порядок команд:
+
+```powershell
+python training/extract_frames.py records/*.mp4      # кадры по клипам
+python training/label.py                             # разметка мышью, только opencv
+python training/build_dataset.py                     # train/val + data.yaml
+python training/train.py                             # обучение YOLO11n
+python training/check_model.py                       # посмотреть глазами
+python training/export_onnx.py                       # raw-branch ONNX (НЕ обычный экспорт!)
+python training/rknn/make_calib.py
+training/rknn/convert.sh training/runs/stations/weights/best.onnx
+python training/upload_model.py training/rknn/stations_rk3576_int8raw.rknn
+```
+
+Обучение живёт в своём окружении (`training/.venv`), на борт из него не ставится ничего.
+Три вещи, из-за которых это делается скриптами, а не руками: экспорт обязан быть
+raw-branch (обычный после INT8 даёт **ноль детекций без ошибок**), архитектура при
+регистрации — **`custom`**, а сплит train/val — **по клипам**, иначе mAP врёт.
+
 ---
 
 ## 7. Работа с настоящим дроном

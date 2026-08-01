@@ -1,0 +1,34 @@
+# Зависимости ОБУЧЕНИЯ — только для машины, на которой учат модель.
+#
+# ⚠️ На борт из этого не ставится НИЧЕГО. Борт исполняет .rknn через предустановленный
+# pioneer_rknn, а установка пакетов на дрон требует смены режима Wi-Fi и потери адреса
+# 172.17.49.2 (CLAUDE.md). Бортовой код по-прежнему живёт на стандартной библиотеке
+# плюс numpy/cv2.
+#
+# Ставится в отдельное окружение, чтобы torch не мешался с requirements.txt проекта:
+#
+#   uv venv --python 3.12 training/.venv
+#   uv pip install --python training/.venv/bin/python -r training/requirements.txt
+#
+# (без uv: python3.12 -m venv training/.venv && training/.venv/bin/pip install -r ...)
+#
+# Python 3.12: torch не собирает колёса под 3.14, а системный 3.9 уже отстаёт от
+# свежих ultralytics.
+
+ultralytics        # обучение и экспорт YOLO11
+onnx               # проверка, что экспорт действительно raw-branch (export_onnx.py)
+onnxruntime        # прогон .onnx на ноуте — сверка с .pt до конвертации
+opencv-python      # разметчик, нарезка кадров
+
+# Нужны ФОРКУ airockchip на шаге экспорта (проверено 01.08.2026). Свежий ultralytics
+# их уже не тянет, а форк — версии 8.3.9, и без них exporter.py падает с
+# ModuleNotFoundError прямо посреди экспорта:
+tqdm
+py-cpuinfo
+pandas
+seaborn
+# torch>=2.9 зовёт onnxscript из нового экспортёра torch.onnx.export
+onnxscript
+
+# rknn-toolkit2 СЮДА НЕ ВХОДИТ намеренно: он существует только под x86-64 Linux
+# и живёт в контейнере (training/rknn/Dockerfile).

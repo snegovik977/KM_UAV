@@ -190,9 +190,13 @@ def main():
             viewer = ImageViewer()
 
         # ---------------------------------------------------------------- запись
+        писать_сырое = bool(cfg.get_path("mission.record_raw", True))
         if cfg["mission"]["record"] and not args.no_record:
             recorder = RecordWriter(out_dir=str(cfg["mission"]["record_dir"]),
                                     fps=float(cfg["mission"]["record_fps"]), log=log)
+            if not писать_сырое:
+                log("[main] запись С РАЗМЕТКОЙ (mission.record_raw: false): "
+                    "смотреть удобно, для обучения модели такие кадры непригодны")
 
         # ------------------------------------------------------------- перцепция
         factory = MessageFactory(cfg["mission"]["src"])
@@ -235,6 +239,11 @@ def main():
                 перцепция.process(frame)
 
             if frame is not None:
+                # Копия ДО отрисовки — материал для обучения (docs/YOLO_TRAINING.md §2).
+                # Записывать аннотированный кадр нельзя: рамки детектора и полоса HUD
+                # попадут в датасет, и сеть выучит их как признак станции. Копия стоит
+                # доли миллисекунды и делается только когда запись включена.
+                сырой = frame.copy() if (recorder is not None and писать_сырое) else None
                 if перцепция is not None:
                     # Отрисовка каждый кадр, инференс — раз в every_n: трансляция
                     # обязана оставаться плавной.
@@ -250,7 +259,7 @@ def main():
                         if ошибки % 30 == 1:
                             log("[перцепция] трансляция: %s: %s" % (type(e).__name__, e))
                 if recorder is not None:
-                    recorder.frame(frame)
+                    recorder.frame(сырой if сырой is not None else frame)
 
             if recorder is not None and time.time() - последняя_телеметрия > 0.2:
                 recorder.telemetry(snapshot)

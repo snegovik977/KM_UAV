@@ -23,12 +23,14 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 | `распределительный хаб/` | `protocol/` — формат пакетов, HTTP-транспорт и привязка карты, **единый источник правды**; `hub.py` — ретранслятор (+ мост `--forward` в формат организаторов); `transmitter.py` — эмулятор автомобиля и дрона; `visualizer.py` — карта станций |
 | `беспилотный автомобиль/` | Чужой трек; пока только README со входом в общий протокол |
 | `launch.py` | Пульт: ssh-ключ, заливка на борт, запуск хаба, визуализатора и дрона, команда на взлёт — одной командой (см. `RUN.md` §0) |
+| `training/` | Обучение YOLO: `extract_frames.py` (кадры из записей по клипам), `label.py` (разметчик на одном cv2), `build_dataset.py` (train/val со сплитом по клипам), `train.py`, `check_model.py`, `export_onnx.py` (**raw-branch**, не обычный экспорт), `rknn/` (Docker + конвертация под rk3576), `upload_model.py` (заливка и регистрация с арх. `custom`), `classes.txt` — единственный список классов. Инструкция — [docs/YOLO_TRAINING.md](docs/YOLO_TRAINING.md). Своё окружение `training/.venv`, на борт из него не ставится ничего |
 | `tests/` | pytest, дрона и сети не требуют |
 | `tools/` | `check_sdk.py`, `check_axes.py`, `diag_model.py` — диагностика борта; `record.py` — запись попыток; `replay.py` — прогон перцепции по записи; `calibrate_camera.py` — интринсики; `eval_detection.py` — mAP и confusion matrix; `check_map.py` — проверка привязки карты глазами; `handheld.py` — камера с рамками станций **без взлёта** (дрон носят на руках) и разбор готовых снимков; `imgio.py` — чтение/запись картинок по путям с кириллицей (`cv2.imread` их на Windows молча не открывает, а директории по регламенту 2.9 русские) |
 | `RUN.md` | Что запускать и в каком порядке; таблица «если не работает». Первое, что читать перед полигоном |
 | `docs/REGLAMENT.md` | Дословная транскрипция официального PDF. Опечатки оригинала помечены `[sic]` и сносками. **Свои выводы сюда не дописывать** |
 | `docs/NOTES.md` | Разбор регламента: сумма баллов, приоритеты, ловушки, разбор задачи заочного этапа |
 | `docs/DRONE_PLAN.md` | Главный проектный документ: архитектура бортового ПО дрона (подзадачи 2.3.1–2.3.4), бюджет ошибки локализации, порядок работ по дням, риски |
+| `docs/YOLO_TRAINING.md` | Обучение модели станций: съёмка, разметка, обучение, raw-branch экспорт, `.rknn`, заливка, включение `backend: yolo`. Восемь шагов, каждый — одна команда |
 | `docs/pioneer_mini2.md` | Железо и SDK по сайту Geoscan |
 | `docs/organizer_handouts.md` | Разбор раздаток организаторов (`HTTP_help.pdf`, описание классов SDK, `MapExample.py` — §2.3) |
 | `docs/lessons_from_archipelago.md` | Разбор чужого репозитория рядом: что переносится, что нет |
@@ -164,6 +166,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Путь RKNN (короткий путь не работает)
 
+Весь конвейер разложен по скриптам в `training/` и описан в [docs/YOLO_TRAINING.md](docs/YOLO_TRAINING.md); ниже — почему он именно такой.
+
 Проверено чужой командой на этом же железе: стандартный ONNX-экспорт с плоской головой `1×6×8400` после INT8 даёт на борту **ноль детекций без единой ошибки**. Рабочая последовательность (`lessons_from_archipelago.md` §2):
 
 1. ONNX из форка `airockchip/ultralytics_yolo11` — сырые тензоры до decode (9 веток);
@@ -174,6 +178,12 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 `.rknn` и код декодера — **пара**: raw-branch модель с плоским декодером даёт мусор без ошибок, версионировать и заливать вместе.
 
 Датасет: сплит train/val **по клипам, а не по кадрам** (соседние кадры протекают в val и mAP врёт). Аугментации под съёмку сверху (`degrees=180`, `flipud`, `scale`); **`hsv_h` выключить** — «покрыта пылью» изображается цветными телами на панели (см. ниже), то есть признак цветовой, и jitter по оттенку травит именно его. Яркость (`hsv_v`) крутить можно и нужно.
+
+Ещё три вещи, каждая из которых ломается молча:
+
+- **классов не меньше двух** (`training/classes.txt` = `detector.labels` в `config.yaml`): ветки RKNN опознаются **по числу каналов**, и при одном классе классовая ветка неотличима от служебной `score-sum`. Сейчас заведены `ok` и `dust`; `broken` ждёт, пока организаторы покажут неисправную станцию;
+- **в запись идёт сырой кадр** (`mission.record_raw: true`): до 01.08.2026 `main.py` писал в `records/*.mp4` кадр уже с рамками детектора и полосой HUD, и на таком материале сеть учит собственную разметку. Старые записи годятся только в негативы;
+- **кадры для обучения — с камеры борта**, а не с телефона: у снимков организаторов другая оптика и масштаб. Снимать `tools/handheld.py --record`, полигон для этого не нужен.
 
 ## Референсный репозиторий рядом
 
@@ -223,6 +233,15 @@ python launch.py --setup    # развернуть выданную машину
 python tools/record.py records/flight_20260731_142530.jsonl   # что происходило
 python tools/replay.py records/flight_20260731_142530.jsonl   # что бы дрон отправил
 python tools/replay.py records/flight_*.jsonl --set detector.min_area_m2=0.05 --out разбор/
+
+# ОБУЧЕНИЕ МОДЕЛИ (своё окружение training/.venv, см. docs/YOLO_TRAINING.md)
+python training/extract_frames.py records/*.mp4          # кадры из записей по клипам
+python training/label.py                                 # разметка мышью (только cv2)
+python training/build_dataset.py                         # train/val + data.yaml
+python training/train.py                                 # YOLO11n
+python training/export_onnx.py                           # raw-branch ONNX + проверка головы
+training/rknn/convert.sh <best.onnx>                     # .rknn под rk3576 (Docker)
+python training/upload_model.py <модель.rknn>            # заливка + регистрация как custom
 
 # КАЛИБРОВКА И ДИАГНОСТИКА (без калибровки «<30 см» не проверить)
 python tools/calibrate_camera.py --grab кадры/          # снять шахматку с борта
