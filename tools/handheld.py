@@ -101,7 +101,7 @@ def main():
     parser.add_argument("--height", type=float, default=None,
                         help="высота камеры над полом, м — если дальномер молчит")
     parser.add_argument("--record", action="store_true",
-                        help="писать flight_*.mp4 и flight_*.jsonl для tools/replay.py")
+                        help="писать records/flight_*.mp4 и .jsonl для tools/replay.py")
     parser.add_argument("--quiet", action="store_true",
                         help="не печатать построчный отчёт по детекциям")
     parser.add_argument("--every", type=float, default=1.0,
@@ -134,11 +134,11 @@ def main():
 
     # Подбор порогов идёт ключами, а не правкой config.yaml на борту: иначе
     # подобранное «на попробовать» рано или поздно уедет в зачётную попытку.
-    # Механизм ровно тот же, что у tools/replay.py — второй реализации быть не должно.
-    from replay import применить_правки
-
+    # Функция живёт в config.py — единственном модуле, который есть и на борту,
+    # и в tools/. Импорт из соседнего инструмента здесь уже ломался: replay.py
+    # на борт не заливается.
     cfg = config_module.load(args.config)
-    применить_правки(cfg, getattr(args, "set", None))
+    config_module.применить_правки(cfg, getattr(args, "set", None), prefix="[руки]")
     log = print
 
     камера = viewer = pioneer = recorder = свой = None

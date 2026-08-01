@@ -24,7 +24,7 @@
 
 Запуск:
     python hub.py                       # 0.0.0.0:5001
-    python hub.py --port 5001 --log hub_log.jsonl
+    python hub.py --port 5001 --log records/hub_log.jsonl
 """
 from __future__ import annotations
 
@@ -125,6 +125,9 @@ class HubState:
         self._log_file = None
         if log_path:
             try:
+                папка = os.path.dirname(log_path)
+                if папка and not os.path.isdir(папка):
+                    os.makedirs(папка)
                 self._log_file = io.open(log_path, "a", encoding="utf-8")
             except Exception as e:
                 print("[hub] не удалось открыть журнал %s: %s" % (log_path, e))
@@ -339,7 +342,9 @@ def main():
     parser = argparse.ArgumentParser(description="Распределительный хаб — ретранслятор пакетов")
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=DEFAULT_PORT)
-    parser.add_argument("--log", default="hub_log.jsonl",
+    # Журнал лежит рядом с записями попыток (records/), а не в корне: разбор вечером
+    # берёт всё из одной папки, и корень репозитория остаётся читаемым.
+    parser.add_argument("--log", default=os.path.join("records", "hub_log.jsonl"),
                         help="журнал принятых пакетов (пусто — не вести)")
     parser.add_argument("--server", choices=("auto", "flask", "stdlib"), default="auto")
     parser.add_argument("--forward", default=None, metavar="URL",

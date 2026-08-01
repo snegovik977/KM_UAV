@@ -20,6 +20,7 @@ cv2 и numpy импортируются мягко: перцепция не им
 """
 from __future__ import annotations
 
+import math
 from collections import namedtuple
 
 try:
@@ -107,8 +108,8 @@ class ClassicDetector(object):
     """
 
     def __init__(self, min_area_m2=0.03, max_area_m2=1.20, aspect_max=4.0,
-                 close_px=9, min_pixels=200, contrast_sigma=2.0, contrast_min=0.10,
-                 contrast_max=0.5, polarity="any", log=None):
+                 close_px=9, close_m=0.06, min_pixels=200, contrast_sigma=2.0,
+                 contrast_min=0.10, contrast_max=0.5, polarity="any", log=None):
         if cv2 is None or np is None:
             raise DetectorUnavailable("классическому детектору нужны cv2 и numpy")
         if polarity not in POLARITIES:
@@ -118,6 +119,7 @@ class ClassicDetector(object):
         self.max_area_m2 = float(max_area_m2)
         self.aspect_max = float(aspect_max)
         self.close_px = int(close_px)
+        self.close_m = float(close_m)
         self.min_pixels = int(min_pixels)
         self.contrast_sigma = float(contrast_sigma)
         self.contrast_min = float(contrast_min)
@@ -167,7 +169,57 @@ class ClassicDetector(object):
                              self.contrast_sigma))
         return фон, порог
 
-    def _маска(self, frame_bgr):
+    def пикселей_в_метре(self, area_m2, shape):
+        """Масштаб земли в центре кадра. None, если позы нет.
+
+        Считается через ту же функцию площади, что и фильтр по м²: берём квадрат
+        известного размера в пикселях, спрашиваем его площадь на земле и извлекаем
+        корень. Отдельного канала для позы детектору не нужно.
+        """
+        if area_m2 is None:
+            return None
+        высота, ширина = shape[:2]
+        cx, cy = ширина / 2.0, высота / 2.0
+        d = 50.0                         # квадрат 100x100 пикселей в центре кадра
+        try:
+            площадь = area_m2([(cx - d, cy - d), (cx + d, cy - d),
+                               (cx + d, cy + d), (cx - d, cy + d)])
+        except Exception:
+            return None
+        if not площадь or площадь <= 0:
+            return None
+        return (2.0 * d) / math.sqrt(площадь)
+
+    def _ядро_склейки(self, area_m2, shape):
+        """Размер морфологического ядра в ПИКСЕЛЯХ для текущей высоты.
+
+        ⚠️ Почему не просто close_px. Панель — это тёмные ячейки, разделённые
+        светлыми линиями голографической сетки. От фона отличаются в основном линии,
+        поэтому маска выходит решёткой с дырами размером в ячейку, и одна станция
+        рассыпается на обрывки — а два обрывка, разошедшиеся дальше assoc_radius,
+        становятся ДВУМЯ станциями в реестре. Это минус 8 баллов ровно так же,
+        как пропущенная станция.
+
+        Дыру надо закрыть морфологией, но её размер задан ГЕОМЕТРИЕЙ ПАНЕЛИ, а не
+        картинкой: ячейка — это сантиметры на земле, а в пикселях она вдвое меньше
+        на вдвое большей высоте. Фиксированный close_px работает на одной высоте
+        и разваливается на другой — ровно тот довод, по которому площадь тут
+        считается в м², а не в пикселях.
+
+        Поэтому основной параметр — close_m (метры), а close_px остаётся нижней
+        границей на случай, когда позы нет (разбор кадров без телеметрии).
+        """
+        ядро = int(self.close_px)
+        if self.close_m > 0:
+            масштаб = self.пикселей_в_метре(area_m2, shape)
+            if масштаб:
+                ядро = max(ядро, int(round(self.close_m * масштаб)))
+        # Ядро обязано быть нечётным и вменяемым: гигантское съест время и слепит
+        # соседние станции.
+        ядро = max(3, min(ядро, 99))
+        return ядро + 1 if ядро % 2 == 0 else ядро
+
+    def _маска(self, frame_bgr, ядро_px=None):
         яркость = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
         яркость = cv2.GaussianBlur(яркость, (5, 5), 0)
         фон, порог = self.background(яркость)
@@ -181,10 +233,16 @@ class ClassicDetector(object):
             маска = np.abs(отклонение) > порог
         маска = маска.astype("uint8") * 255
 
-        ядро = cv2.getStructuringElement(cv2.MORPH_ELLIPSE,
-                                         (self.close_px, self.close_px))
-        маска = cv2.morphologyEx(маска, cv2.MORPH_OPEN, ядро)
-        return cv2.morphologyEx(маска, cv2.MORPH_CLOSE, ядро)
+        # Открытие убирает шум и должно остаться МЕЛКИМ: большим ядром оно съест
+        # тонкие линии сетки, из которых маска панели в основном и состоит.
+        мелкое = cv2.getStructuringElement(cv2.MORPH_ELLIPSE,
+                                           (self.close_px, self.close_px))
+        маска = cv2.morphologyEx(маска, cv2.MORPH_OPEN, мелкое)
+        # Закрытие, наоборот, обязано быть по размеру ячейки панели — им и сшиваются
+        # обрывки в одно пятно.
+        размер = int(ядро_px or self.close_px)
+        крупное = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (размер, размер))
+        return cv2.morphologyEx(маска, cv2.MORPH_CLOSE, крупное)
 
     def detect(self, frame_bgr, area_m2=None, rejected=None):
         """Список Detection. area_m2 — функция углов в пиксели -> площадь в м²
@@ -198,7 +256,7 @@ class ClassicDetector(object):
         видно, но она не прошла порог площади» — разные болезни с разным лечением,
         а по одному лишь пустому списку детекций они неразличимы.
         """
-        маска = self._маска(frame_bgr)
+        маска = self._маска(frame_bgr, self._ядро_склейки(area_m2, frame_bgr.shape))
         найденное = cv2.findContours(маска, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         контуры = найденное[0] if len(найденное) == 2 else найденное[1]
 
@@ -459,6 +517,7 @@ def create_detector(cfg, log=None):
         max_area_m2=float(раздел.get("max_area_m2", 1.20)),
         aspect_max=float(раздел.get("aspect_max", 4.0)),
         close_px=int(раздел.get("close_px", 9)),
+        close_m=float(раздел.get("close_m", 0.06)),
         min_pixels=int(раздел.get("min_pixels", 200)),
         contrast_sigma=float(раздел.get("contrast_sigma", 2.0)),
         contrast_min=float(раздел.get("contrast_min", 0.10)),

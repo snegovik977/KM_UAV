@@ -142,6 +142,9 @@ class StationRegistry(object):
                  log=None, prefix=None):
         раздел = cfg.get("fusion", {})
         self.assoc_radius = float(раздел.get("assoc_radius", 0.40))
+        # Физический минимум между центрами двух РАЗНЫХ станций. Всё, что ближе, —
+        # это одна станция, как бы ни разошлись наблюдения. См. _ближайшая().
+        self.min_separation = float(раздел.get("min_separation", 0.0))
         self.confirm_obs = int(раздел.get("confirm_obs", 3))
         self.max_obs = int(раздел.get("max_obs", 60))
         self.status_min_conf = float(раздел.get("status_min_conf", 0.6))
@@ -163,6 +166,7 @@ class StationRegistry(object):
         self._next_id = 1
         self.observations = 0
         self.rejected_far = 0           # наблюдения, отброшенные как «слишком далеко»
+        self.prevented_splits = 0       # сколько раз не дали одной станции стать двумя
 
     # ------------------------------------------------------------------ наблюдения
 
@@ -187,19 +191,35 @@ class StationRegistry(object):
         with self._lock:
             self.observations += 1
             станция = self._ближайшая(x, y)
-            if станция is None:
-                if len(self._stations) >= self.max_stations:
+            if станция is not None:
+                станция.add(x, y, status, conf, precise)
+            else:
+                # Между assoc_radius и min_separation — МЁРТВАЯ ЗОНА: наблюдение
+                # слишком далеко, чтобы уточнять координату, но ближе, чем физически
+                # может стоять вторая станция (расстановку мерили рулеткой). Значит
+                # это разбросанное наблюдение той же станции — чаще всего обрывок
+                # панели, который детектор увидел отдельным пятном.
+                # Заводить по нему новую запись нельзя: одна станция превратится
+                # в две, а это те же 8 баллов, что и пропущенная.
+                сосед = (self._ближайшая(x, y, радиус=self.min_separation)
+                         if self.min_separation > self.assoc_radius else None)
+                if сосед is not None:
+                    self.prevented_splits += 1
+                    # Наблюдение соседа, но ГРУБОЕ: подтверждать станцию оно вправе,
+                    # а тянуть её координату к обрывку — нет.
+                    сосед.add(x, y, status, conf, precise=False)
+                    станция = сосед
+                elif len(self._stations) >= self.max_stations:
                     # Больше станций, чем бывает на полигоне (регламент: 3-5), —
                     # признак того, что детектор сыпет ложными. Молча плодить записи
                     # нельзя: счёт станций и есть критерий 8 баллов.
                     self.rejected_far += 1
                     return None
-                станция = Station("%s%d" % (self.prefix, self._next_id), x, y,
-                                  status, conf, precise, max_obs=self.max_obs)
-                self._next_id += 1
-                self._stations.append(станция)
-            else:
-                станция.add(x, y, status, conf, precise)
+                else:
+                    станция = Station("%s%d" % (self.prefix, self._next_id), x, y,
+                                      status, conf, precise, max_obs=self.max_obs)
+                    self._next_id += 1
+                    self._stations.append(станция)
 
             новая = self._подтвердилась(станция)
             уточнилась = self._координата_уехала(станция)
@@ -213,10 +233,10 @@ class StationRegistry(object):
         self._обновить_состояние()
         return станция
 
-    def _ближайшая(self, x, y):
-        """Станция ближе assoc_radius или None. Порог больше нашей точности, но меньше
-        реального расстояния между станциями."""
-        лучшая, расстояние = None, self.assoc_radius
+    def _ближайшая(self, x, y, радиус=None):
+        """Станция ближе радиуса или None. По умолчанию радиус — assoc_radius:
+        больше нашей точности, но меньше реального расстояния между станциями."""
+        лучшая, расстояние = None, (self.assoc_radius if радиус is None else радиус)
         for станция in self._stations:
             d = станция.distance_to(x, y)
             if d < расстояние:
@@ -327,9 +347,16 @@ class StationRegistry(object):
         подтверждено = self.confirmed_count()
         with self._lock:
             всего = len(self._stations)
-        return ("[реестр] наблюдений %d, станций подтверждено %d (кандидатов %d), "
-                "отброшено %d" % (self.observations, подтверждено,
-                                  всего - подтверждено, self.rejected_far))
+        текст = ("[реестр] наблюдений %d, станций подтверждено %d (кандидатов %d), "
+                 "отброшено %d" % (self.observations, подтверждено,
+                                   всего - подтверждено, self.rejected_far))
+        if self.prevented_splits:
+            # Не украшение: большое число означает, что детектор регулярно рвёт
+            # панель на куски, и защита в реестре работает вместо лечения причины.
+            текст += ("\n[реестр] предотвращено расколов станции на две: %d "
+                      "(если много — поднять detector.close_m)"
+                      % self.prevented_splits)
+        return текст
 
 
 def _конечное(значение):

@@ -5,12 +5,15 @@ __pycache__/
 .venv/
 venv/
 
-# Артефакты оффлайн-прогонов (tools/record.py, tools/replay.py, run_on_video.py)
+# Артефакты оффлайн-прогонов (tools/replay.py, run_on_video.py)
 run_output/
-records/
+разбор/
 *.log
 
-# Записи попыток и журналы хаба: их место в облаке команды, а не в git
+# Записи попыток и журнал хаба: их место в облаке команды, а не в git.
+# Всё это пишется в records/ (config.yaml -> mission.record_dir, hub.py --log);
+# маски по имени оставлены для записей, прилетевших с борта или из старых запусков.
+records/
 flight_*.mp4
 flight_*.jsonl
 hub_log.jsonl

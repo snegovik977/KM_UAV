@@ -7,16 +7,16 @@
 станций оказалось шесть вместо четырёх» обязаны делаться по записи, а полигон
 тратиться только на попытки.
 
-На вход — пара файлов от tools/record.py:
+На вход — пара файлов от tools/record.py (лежат в records/):
 
-    flight_20260731_142530.mp4      кадры, как их видела перцепция
-    flight_20260731_142530.jsonl    снимки состояния миссии
+    records/flight_20260731_142530.mp4      кадры, как их видела перцепция
+    records/flight_20260731_142530.jsonl    снимки состояния миссии
 
 Совмещаются они по полю frame в jsonl: там записан номер кадра на момент снимка.
 
-    python3 tools/replay.py flight_20260731_142530.jsonl
-    python3 tools/replay.py flight_*.jsonl --set detector.min_area_m2=0.05
-    python3 tools/replay.py flight_*.jsonl --out разбор/     # кадры с рамками
+    python3 tools/replay.py records/flight_20260731_142530.jsonl
+    python3 tools/replay.py records/flight_*.jsonl --set detector.min_area_m2=0.05
+    python3 tools/replay.py records/flight_*.jsonl --out разбор/     # кадры с рамками
 """
 from __future__ import annotations
 
@@ -67,25 +67,6 @@ def поза_для_кадра(записи, номер):
     return подходящая
 
 
-def применить_правки(cfg, правки):
-    """--set detector.min_area_m2=0.05 -> cfg["detector"]["min_area_m2"] = 0.05.
-
-    Подбор порогов идёт ключами, а не правкой config.yaml: иначе рано или поздно
-    подобранное значение уедет на борт вместе с отладочным мусором.
-    """
-    for правка in правки or []:
-        путь, _, значение = правка.partition("=")
-        части = путь.strip().split(".")
-        узел = cfg
-        for часть in части[:-1]:
-            узел = узел.setdefault(часть, {})
-        try:
-            узел[части[-1]] = float(значение)
-        except ValueError:
-            узел[части[-1]] = значение.strip()
-        print("[разбор] %s = %r" % (путь.strip(), узел[части[-1]]))
-
-
 class СобирающийТранспорт(object):
     """Вместо хаба — список: разбор не должен требовать сети."""
 
@@ -126,7 +107,7 @@ def main():
         return 1
 
     cfg = config_module.load(args.config)
-    применить_правки(cfg, args.правки)
+    config_module.применить_правки(cfg, args.правки, prefix="[разбор]")
 
     записи = прочитать_телеметрию(args.log)
     if not записи:
