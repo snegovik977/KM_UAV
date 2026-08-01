@@ -55,6 +55,55 @@ import urllib.request
 
 PY = sys.executable or "python3"
 
+# ------------------------------------------------------------------ консоль Windows
+#
+# Windows OpenSSH с ключом -tt переводит в raw-режим КОНСОЛЬ, а не свой (перенаправленный
+# в pipe) stdin: гасит на CONIN$ флаги ENABLE_PROCESSED_INPUT | ENABLE_LINE_INPUT |
+# ENABLE_ECHO_INPUT и включает ENABLE_VIRTUAL_TERMINAL_INPUT. Консоль общая с пультом,
+# и восстановить режим при выходе ssh не обещает — проверено на OpenSSH_for_Windows_9.5p2
+# (режим 0x1f7 -> 0x3e8 и обратно не возвращался).
+#
+# Последствия ровно две, и обе неприятные:
+#   * набранная команда не отображается и не собирается в строку — печатать вслепую;
+#   * Ctrl+C приходит байтом \x03 в stdin вместо KeyboardInterrupt, то есть аварийная
+#     посадка по Ctrl+C (RUN.md §9) молча перестаёт работать.
+#
+# Защиты две, независимые: дочерние процессы запускаются вообще без консоли
+# (ФЛАГИ_ЗАПУСКА), а режим консоли всё равно чинится силой — она могла остаться
+# сломанной от прошлого запуска, убитого закрытием окна.
+
+# CREATE_NO_WINDOW: у процесса нет консоли, трогать ему нечего. Весь ввод-вывод у наших
+# процессов и так идёт через pipe, поэтому не теряется ничего — проверено на борту,
+# вывод ssh -tt идёт как раньше и '\x03' по-прежнему прерывает удалённый python.
+ФЛАГИ_ЗАПУСКА = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
+_ПОСТРОЧНЫЙ_ВВОД = 0x0001 | 0x0002 | 0x0004   # PROCESSED_INPUT | LINE_INPUT | ECHO_INPUT
+_VT_ВВОД = 0x0200                             # VIRTUAL_TERMINAL_INPUT
+_STD_INPUT_HANDLE = -10
+
+
+def починить_консоль():
+    """Вернуть консоли построчный ввод с эхом. True — если пришлось чинить.
+
+    Вне Windows и при перенаправленном stdin не делает ничего.
+    """
+    if os.name != "nt":
+        return False
+    try:
+        import ctypes
+
+        kernel32 = ctypes.windll.kernel32
+        дескриптор = kernel32.GetStdHandle(_STD_INPUT_HANDLE)
+        текущий = ctypes.c_uint()
+        if not kernel32.GetConsoleMode(дескриптор, ctypes.byref(текущий)):
+            return False                       # stdin не консоль (pipe, файл) — не наше дело
+        нужный = (текущий.value | _ПОСТРОЧНЫЙ_ВВОД) & ~_VT_ВВОД
+        if нужный == текущий.value:
+            return False
+        return bool(kernel32.SetConsoleMode(дескриптор, нужный))
+    except (AttributeError, OSError, ValueError):
+        return False
+
 
 # --------------------------------------------------------------------------- вывод
 
@@ -76,12 +125,43 @@ def спроси(вопрос, по_умолчанию=True, авто=None):
         return по_умолчанию
     подсказка = "[Y/n]" if по_умолчанию else "[y/N]"
     try:
-        ответ = input("%s %s " % (вопрос, подсказка)).strip().lower()
+        ответ = input("%s %s " % (вопрос, подсказка))
     except (EOFError, KeyboardInterrupt):
         return False
+    return _да(ответ, по_умолчанию)
+
+
+def _да(строка, по_умолчанию):
+    ответ = (строка or "").strip().lower()
     if not ответ:
         return по_умолчанию
     return ответ[0] in ("y", "д", "1")
+
+
+def спроси_очередью(вопрос, очередь, по_умолчанию=True, авто=None):
+    """То же, что спроси(), но берёт ответ из очереди читалки stdin.
+
+    После работы пульта stdin занят фоновым потоком: остановить его нельзя (он висит
+    в блокирующем чтении), а input() из главного потока отбирал бы у него строку через
+    раз — вопрос «забрать записи?» то зависал бы, то отвечал сам себе. Поэтому
+    последний вопрос идёт через ту же очередь, что и команды.
+    """
+    if авто is not None:
+        скажи("%s %s" % (вопрос, "да" if авто else "нет"))
+        return авто
+    if очередь is None:
+        return спроси(вопрос, по_умолчанию, авто)
+    with _печать:
+        sys.stdout.write("%s %s " % (вопрос, "[Y/n]" if по_умолчанию else "[y/N]"))
+        sys.stdout.flush()
+    try:
+        строка = очередь.get()
+    except (EOFError, KeyboardInterrupt):
+        return False
+    if строка is None:                          # stdin закончился
+        скажи("")
+        return по_умолчанию
+    return _да(строка, по_умолчанию)
 
 
 # ----------------------------------------------------------------------------- ssh
@@ -172,8 +252,21 @@ def план_заливки(корень=КОРЕНЬ, конфиг=True):
           os.path.join(корень, "распределительный хаб", "transmitter.py")], ""),
         (sorted(glob.glob(os.path.join(корень, "распределительный хаб", "protocol", "*.py"))),
          "protocol"),
+        # Инструменты, которые запускаются НА БОРТУ (см. RUN.md §7). Список правится
+        # только здесь: второго перечня файлов в репозитории быть не должно.
+        #   record.py         — запись попыток, её импортирует handheld.py --record
+        #   check_sdk.py      — что на самом деле умеет SDK (§7.2)
+        #   check_axes.py     — оси и единицы yaw, единственная проверка с полётом (§7.3)
+        #   calibrate_camera.py — съёмка шахматки с борта (§7.5)
+        #   handheld.py       — камера с рамками станций без взлёта (§7.6а)
+        #   diag_model.py     — почему у модели ноль детекций (§7.7)
+        #   imgio.py          — его импортируют handheld.py и calibrate_camera.py
+        #   mjpeg.py          — своя трансляция в браузер, не зависит от gstreamer
+        #   check_camera.py   — почему камера не отдаёт кадров (§7.6б)
         ([os.path.join(корень, "tools", имя)
-          for имя in ("record.py", "check_sdk.py", "check_axes.py")], "tools"),
+          for имя in ("record.py", "check_sdk.py", "check_axes.py",
+                      "calibrate_camera.py", "handheld.py", "diag_model.py",
+                      "imgio.py", "mjpeg.py", "check_camera.py")], "tools"),
     ]
     if конфиг:
         группы.insert(1, ([os.path.join(корень, "квадрокоптер", "config.yaml")], ""))
@@ -236,7 +329,10 @@ class Процесс:
             argv, cwd=cwd or КОРЕНЬ, env=окружение,
             stdin=subprocess.PIPE if stdin_pipe else subprocess.DEVNULL,
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            bufsize=1, universal_newlines=True, encoding="utf-8", errors="replace")
+            bufsize=1, universal_newlines=True, encoding="utf-8", errors="replace",
+            # Без своей консоли: иначе ssh -tt перекроит общую с пультом и набирать
+            # команды придётся вслепую (см. ФЛАГИ_ЗАПУСКА выше).
+            creationflags=ФЛАГИ_ЗАПУСКА)
         self.поток = threading.Thread(target=self._читать, daemon=True)
         self.поток.start()
 
@@ -567,6 +663,10 @@ def пульт(процессы, url, аргументы, борт):
     держать окно открытым незачем, хаб гасится следом.
     """
     дрон = процессы[-1]
+    # Процессы уже запущены: если консоль всё-таки успели перекроить (чужой ssh в этом
+    # же окне, прошлый убитый запуск), чиним до того, как ждать от оператора команды.
+    if починить_консоль():
+        скажи("[пульт] консоль была в raw-режиме — вернул эхо и построчный ввод")
     скажи("")
     скажи("== Пульт ==  t — взлёт   s — состояние   q — посадить и выйти  (Ctrl+C тоже) ==")
     скажи("")
@@ -609,8 +709,9 @@ def пульт(процессы, url, аргументы, борт):
     # Гасим в обратном порядке: сначала дрон (ему нужно сесть), потом хаб.
     for п in reversed(процессы):
         п.стоп()
+    починить_консоль()          # ssh мог уйти, оставив консоль в raw-режиме
 
-    if борт and спроси("Забрать записи полёта с борта?", True, аргументы.авто):
+    if борт and спроси_очередью("Забрать записи полёта с борта?", ввод, True, аргументы.авто):
         забрать_записи(аргументы.drone, аргументы.user, аргументы.dir)
         скажи("[пульт] разбор: %s tools/record.py flight_*.jsonl" % os.path.basename(PY))
     return 0

@@ -26,6 +26,8 @@ import json
 import os
 import sys
 
+import imgio                            # чтение/запись по путям с кириллицей
+
 _ЗДЕСЬ = os.path.dirname(os.path.abspath(__file__))
 _КОРЕНЬ = os.path.dirname(_ЗДЕСЬ)
 for _путь in (_ЗДЕСЬ, _КОРЕНЬ, os.path.join(_КОРЕНЬ, "квадрокоптер"),
@@ -173,8 +175,14 @@ def main():
             детекции = перцепция.process(кадр)
             if детекции and args.out:
                 перцепция.draw(кадр, детекции)
-                cv2.imwrite(os.path.join(args.out, "кадр_%05d.jpg" % номер), кадр)
-                сохранено += 1
+                # Имя файла русское, и через cv2.imwrite оно на Windows не пишется
+                # МОЛЧА, даже если сама папка латиницей (см. tools/imgio.py).
+                if not imgio.imwrite(
+                        os.path.join(args.out, "кадр_%05d.jpg" % номер), кадр):
+                    print("не удалось записать кадр в %s" % args.out)
+                    args.out = None
+                else:
+                    сохранено += 1
     finally:
         поток.release()
 

@@ -29,6 +29,8 @@ import glob
 import os
 import sys
 
+import imgio                            # чтение/запись по путям с кириллицей
+
 
 def снять_кадры(куда, сколько, углы, servo):
     """Съёмка шахматки с борта: кадр сохраняется, только если доска найдена."""
@@ -55,7 +57,9 @@ def снять_кадры(куда, сколько, углы, servo):
             if not найдено:
                 continue
             путь = os.path.join(куда, "calib_%03d.png" % сохранено)
-            cv2.imwrite(путь, кадр)
+            if not imgio.imwrite(путь, кадр):
+                print("не удалось записать %s — снимаю в другую папку" % путь)
+                break
             сохранено += 1
             print("[%d/%d] %s" % (сохранено, сколько, путь))
     finally:
@@ -80,7 +84,7 @@ def посчитать(пути, углы, клетка_мм):
     критерий = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 0.001)
 
     for путь in пути:
-        кадр = cv2.imread(путь)
+        кадр = imgio.imread(путь)
         if кадр is None:
             print("  %s: не читается" % путь)
             continue

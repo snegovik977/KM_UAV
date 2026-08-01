@@ -81,14 +81,20 @@ class ClassicDetector(object):
     контуры -> minAreaRect -> фильтр по площади в м² и по вытянутости.
 
     ⚠️ Отступление от плана, и намеренное. План описывал порог Оцу по тёмному пятну
-    на светлом полу. Оба допущения оказались негодными:
+    на светлом полу. Оба допущения оказались негодными, и фотографии настоящих станций
+    (`фото станции/`, разобраны 01.08.2026) это подтвердили:
 
-    1. Оцу делит кадр ровно надвое и физически не может взять в один проход тёмную
-       исправную панель и СВЕТЛУЮ запылённую — а «покрыта пылью» и распознаётся именно
-       по повышенной яркости (docs/DRONE_PLAN.md §3.2). Пропущенная запылённая станция
-       рушит и счёт станций в 2.3.2, и наведение в 2.3.4.
-    2. «Светлый пол» — вообще не наш случай: на карте полигона от организаторов
-       (source/2_step/) покрытие ТЁМНОЕ, со светлой разметкой.
+    1. «Светлый пол» — не наш случай: покрытие ТЁМНО-СЕРОЕ, со СВЕТЛОЙ разметкой,
+       а по краям попадает светлый ковролин. Оцу делит кадр ровно надвое, поэтому
+       на таком кадре он отрежет разметку и ковролин, а не станцию.
+    2. Панель тоже тёмная — тёмные ячейки на тёмном полу, разница по яркости
+       невелика. Зато у панели есть радужная рамка и светлая сетка между ячейками,
+       то есть внутри маски она СВЕТЛЕЕ фона, а по телу ячеек — темнее. Одним знаком
+       такое пятно не описывается.
+
+    Отсюда polarity: any по умолчанию — берётся любое отклонение от фона в любую
+    сторону, и станция собирается в одно пятно морфологическим закрытием.
+    Пропущенная станция рушит и счёт в 2.3.2, и наведение в 2.3.4.
 
     Поэтому фон оценивается робастно (медиана и MAD по кадру), а объектом считается
     всё, что отклонилось от него сильнее порога, в любую сторону. Порог адаптивный:
@@ -101,8 +107,8 @@ class ClassicDetector(object):
     """
 
     def __init__(self, min_area_m2=0.03, max_area_m2=1.20, aspect_max=4.0,
-                 close_px=9, min_pixels=200, contrast_sigma=6.0, contrast_min=0.12,
-                 polarity="any", log=None):
+                 close_px=9, min_pixels=200, contrast_sigma=2.0, contrast_min=0.10,
+                 contrast_max=0.5, polarity="any", log=None):
         if cv2 is None or np is None:
             raise DetectorUnavailable("классическому детектору нужны cv2 и numpy")
         if polarity not in POLARITIES:
@@ -115,8 +121,10 @@ class ClassicDetector(object):
         self.min_pixels = int(min_pixels)
         self.contrast_sigma = float(contrast_sigma)
         self.contrast_min = float(contrast_min)
+        self.contrast_max = float(contrast_max)
         self.polarity = polarity
         self._log = log or (lambda text: print(text))
+        self._потолок_сработал = 0       # сколько кадров порог упирался в потолок
 
     def background(self, gray):
         """Яркость фона и порог отклонения от неё, оба — по самому кадру.
@@ -124,10 +132,39 @@ class ClassicDetector(object):
         Отдельным методом, потому что это же число печатает tools/replay.py: на разборе
         решения (регламент 2.7) надо уметь показать, откуда порог взялся, а не сказать
         «подобрали».
+
+        Порог зажат с ДВУХ сторон, и верхняя граница — не украшение:
+
+          снизу  contrast_min доли диапазона. На идеально однородном полу разброс
+                 нулевой, и без нижней границы «объектом» становится шум матрицы;
+          сверху contrast_max доли диапазона. Отклонение яркости физически не бывает
+                 больше 255, поэтому порог выше этого числа означает детектор,
+                 который не может сработать НИКОГДА — ни одной ошибки в логе,
+                 ни одной детекции, и разбирать нечего.
+
+        Верхняя граница добавлена 01.08.2026 после разбора настоящих фотографий
+        площадки (`фото станции/`): робастный разброс на них 24-85 уровней вместо
+        почти нуля у заглушки, и прежний contrast_sigma=6.0 давал порог 142-507.
+        На четырёх снимках из девяти он превышал 255, то есть детектор был слеп
+        математически. Заглушка этого показать не могла в принципе: она рисует
+        станции на однородном фоне, где разброс близок к нулю и порог всегда падает
+        на нижнюю границу.
         """
         фон = float(np.median(gray))
         разброс = float(np.median(np.abs(gray.astype("float32") - фон))) * _MAD_В_СИГМУ
         порог = max(self.contrast_sigma * разброс, self.contrast_min * 255.0)
+        потолок = self.contrast_max * 255.0
+        if порог > потолок:
+            порог = потолок
+            self._потолок_сработал += 1
+            # Раз в 100 кадров: сообщение важное, но оно не должно залить лог полёта.
+            if self._потолок_сработал % 100 == 1:
+                self._log("[детектор] ВНИМАНИЕ: разброс фона %.0f, порог по sigma вышел "
+                          "%.0f — упёрся в потолок %.0f. Кадр слишком пёстрый для "
+                          "contrast_sigma=%.1f, детекций может не быть вовсе. "
+                          "Проверить tools/handheld.py и снизить contrast_sigma"
+                          % (разброс, self.contrast_sigma * разброс, потолок,
+                             self.contrast_sigma))
         return фон, порог
 
     def _маска(self, frame_bgr):
@@ -149,18 +186,34 @@ class ClassicDetector(object):
         маска = cv2.morphologyEx(маска, cv2.MORPH_OPEN, ядро)
         return cv2.morphologyEx(маска, cv2.MORPH_CLOSE, ядро)
 
-    def detect(self, frame_bgr, area_m2=None):
+    def detect(self, frame_bgr, area_m2=None, rejected=None):
         """Список Detection. area_m2 — функция углов в пиксели -> площадь в м²
         (её даёт локализация по текущей позе). Без неё фильтр по площади не работает,
         и остаётся только фильтр по вытянутости — так бывает при отладке по записи
-        без телеметрии."""
+        без телеметрии.
+
+        rejected — необязательный список, куда складываются ОТВЕРГНУТЫЕ кандидаты
+        как (Detection, причина, число). В полёте не используется (лишняя работа
+        на каждый кадр), нужен инструментам разбора: «станцию не видно» и «станцию
+        видно, но она не прошла порог площади» — разные болезни с разным лечением,
+        а по одному лишь пустому списку детекций они неразличимы.
+        """
         маска = self._маска(frame_bgr)
         найденное = cv2.findContours(маска, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         контуры = найденное[0] if len(найденное) == 2 else найденное[1]
 
+        def отвергнуть(rect, причина, число):
+            if rejected is not None and rect is not None:
+                rejected.append((_rect_to_detection(rect, 0.0, None, frame_bgr.shape),
+                                 причина, число))
+
         детекции = []
         for контур in контуры:
-            if cv2.contourArea(контур) < self.min_pixels:
+            пикселей = cv2.contourArea(контур)
+            if пикселей < self.min_pixels:
+                if rejected is not None and пикселей >= self.min_pixels / 10.0:
+                    # Совсем мелкий мусор не показываем: его в кадре сотни.
+                    отвергнуть(cv2.minAreaRect(контур), "мало пикселей", пикселей)
                 continue
             rect = cv2.minAreaRect(контур)
             (_, _), (w, h), _ = rect
@@ -168,12 +221,17 @@ class ClassicDetector(object):
                 continue
             вытянутость = max(w, h) / min(w, h)
             if вытянутость > self.aspect_max:
+                отвергнуть(rect, "вытянутость", вытянутость)
                 continue
 
             детекция = _rect_to_detection(rect, 1.0, None, frame_bgr.shape)
             if area_m2 is not None:
                 площадь = area_m2(детекция.corners)
-                if площадь is None or not self.min_area_m2 <= площадь <= self.max_area_m2:
+                if площадь is None:
+                    отвергнуть(rect, "площадь не считается", 0.0)
+                    continue
+                if not self.min_area_m2 <= площадь <= self.max_area_m2:
+                    отвергнуть(rect, "площадь м2", площадь)
                     continue
                 # Уверенность — насколько плотно контур заполняет свой minAreaRect.
                 # Реестр взвешивает по ней голоса, и «клякса» должна весить меньше
@@ -339,7 +397,9 @@ class YoloRknnDetector(object):
             raise DetectorUnavailable("модель %r не поднялась: %s: %s"
                                       % (model_name, type(e).__name__, e))
 
-    def detect(self, frame_bgr, area_m2=None):
+    def detect(self, frame_bgr, area_m2=None, rejected=None):
+        # rejected принимается для совместимости с классическим детектором, но
+        # не заполняется: у сети «отвергнутых кандидатов» нет, есть порог conf.
         высота, ширина = frame_bgr.shape[:2]
         вход = cv2.resize(frame_bgr, (self.img_size, self.img_size))
         # КРИТИЧНО: камера борта отдаёт BGR, модель обучена на RGB. Без этого сеть
@@ -400,8 +460,9 @@ def create_detector(cfg, log=None):
         aspect_max=float(раздел.get("aspect_max", 4.0)),
         close_px=int(раздел.get("close_px", 9)),
         min_pixels=int(раздел.get("min_pixels", 200)),
-        contrast_sigma=float(раздел.get("contrast_sigma", 6.0)),
-        contrast_min=float(раздел.get("contrast_min", 0.12)),
+        contrast_sigma=float(раздел.get("contrast_sigma", 2.0)),
+        contrast_min=float(раздел.get("contrast_min", 0.10)),
+        contrast_max=float(раздел.get("contrast_max", 0.5)),
         polarity=str(раздел.get("polarity", "any")),
         log=log)
     log("[детектор] классический CV (отклонение от фона, полярность %s, "

@@ -8,6 +8,8 @@
 from __future__ import annotations
 
 import os
+import queue
+import subprocess
 import sys
 
 import pytest
@@ -92,6 +94,58 @@ def test_ssh_batch_не_спрашивает_пароль():
 def test_ssh_принимает_чужой_борт():
     argv = launch.ssh("true", хост="10.42.0.1", пользователь="pi")
     assert "pi@10.42.0.1" in argv
+
+
+def test_дочерние_процессы_запускаются_без_консоли(monkeypatch):
+    """Windows OpenSSH с -tt переводит в raw-режим ОБЩУЮ консоль, а не свой stdin:
+    гасит эхо и построчный ввод и не возвращает их при выходе. Пульт делит консоль
+    с двумя такими ssh (хаб и дрон), поэтому команды приходилось набирать вслепую,
+    а Ctrl+C приходил байтом \\x03 вместо KeyboardInterrupt — то есть аварийная
+    посадка переставала работать. Лечится тем, что консоли у детей просто нет."""
+    поймано = {}
+
+    class ЗаглушкаPopen:
+        def __init__(self, argv, **kwargs):
+            поймано.update(kwargs)
+            self.stdout = []
+            self.stdin = None
+
+        def poll(self):
+            return 0
+
+    monkeypatch.setattr(subprocess, "Popen", ЗаглушкаPopen)
+    launch.Процесс("дрон", ["ssh", "-tt", "хост", "python3 main.py"])
+
+    assert поймано["creationflags"] == launch.ФЛАГИ_ЗАПУСКА
+    if os.name == "nt":
+        assert launch.ФЛАГИ_ЗАПУСКА == subprocess.CREATE_NO_WINDOW
+    else:
+        # На POSIX Popen принимает только нулевой creationflags
+        assert launch.ФЛАГИ_ЗАПУСКА == 0
+
+
+def test_починить_консоль_не_падает_без_консоли():
+    # Под pytest stdin перенаправлен, консоли нет: функция обязана тихо вернуть False,
+    # а не свалить пульт на старте.
+    assert launch.починить_консоль() in (True, False)
+
+
+@pytest.mark.parametrize("ответ, ожидание", [
+    ("y\n", True), ("д\n", True), ("\n", True), ("n\n", False), ("нет\n", False),
+])
+def test_финальный_вопрос_читается_из_очереди_пульта(ответ, ожидание):
+    """Читалку stdin остановить нельзя — она висит в блокирующем чтении. Второй
+    input() из главного потока отбирал бы у неё строку через раз, и вопрос
+    «забрать записи?» то зависал бы, то отвечал сам себе."""
+    очередь = queue.Queue()
+    очередь.put(ответ)
+    assert launch.спроси_очередью("Забрать?", очередь, True) is ожидание
+
+
+def test_финальный_вопрос_переживает_конец_stdin():
+    очередь = queue.Queue()
+    очередь.put(None)                    # читалка отдала EOF
+    assert launch.спроси_очередью("Забрать?", очередь, True) is True
 
 
 def test_обязательные_пакеты_совпадают_с_requirements():

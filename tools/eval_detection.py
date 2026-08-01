@@ -27,6 +27,8 @@ import glob
 import os
 import sys
 
+import imgio                            # чтение/запись по путям с кириллицей
+
 _ЗДЕСЬ = os.path.dirname(os.path.abspath(__file__))
 _КОРЕНЬ = os.path.dirname(_ЗДЕСЬ)
 for _путь in (_ЗДЕСЬ, _КОРЕНЬ, os.path.join(_КОРЕНЬ, "квадрокоптер")):
@@ -162,7 +164,7 @@ def main():
     матрица = [[0] * (len(КЛАССЫ) + 1) for _ in КЛАССЫ]
 
     for путь in пути:
-        кадр = cv2.imread(путь)
+        кадр = imgio.imread(путь)
         if кадр is None:
             continue
         высота, ширина = кадр.shape[:2]

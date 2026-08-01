@@ -133,6 +133,31 @@ class MapView(object):
         return ", ".join(части)
 
 
+def прочитать_картинку(path):
+    """cv2.imread вместо путей с кириллицей — обязательно, а не на всякий случай.
+
+    На Windows imread отдаёт путь в C-runtime в кодировке ANSI, и `распределительный хаб`
+    в неё не переводится: файл существует, а imread молча возвращает None. Переименовать
+    директорию нельзя — русские имена трёх директорий требует регламент 2.9.
+    Симптом на площадке: станции рисуются на пустой сетке вместо карты полигона, то есть
+    ровно то, за что дают 8 баллов, не показывается. Проверено 01.08.2026.
+
+    То же самое лечит tools/imgio.py для инструментов разбора; здесь копия, потому что
+    визуализатор обязан оставаться самодостаточным (его кладут на борт рядом с protocol/).
+    """
+    if cv2 is None:
+        return None
+    if np is None:                       # без numpy остаётся только штатный путь
+        return cv2.imread(path)
+    try:
+        буфер = np.fromfile(path, dtype=np.uint8)
+    except (OSError, ValueError):
+        return None
+    if буфер.size == 0:
+        return None
+    return cv2.imdecode(буфер, cv2.IMREAD_COLOR)
+
+
 def загрузить_карту(path, width=1200, height=900):
     """Картинка полигона или пустой холст, если её нет.
 
@@ -140,7 +165,7 @@ def загрузить_карту(path, width=1200, height=900):
     появиться позже, а станции надо видеть уже сейчас — хотя бы на сетке.
     """
     if cv2 is not None and path and os.path.exists(path):
-        карта = cv2.imread(path)
+        карта = прочитать_картинку(path)
         if карта is not None:
             return карта
         print("[карта] %s не читается — рисую на сетке" % path)
@@ -260,8 +285,17 @@ def main():
         print("\n[карта] остановлено оператором")
     finally:
         if args.save and кадр is not None and cv2 is not None:
-            cv2.imwrite(args.save, кадр)
-            print("[карта] сохранено: %s" % args.save)
+            # Та же беда с кириллицей, что в прочитать_картинку(), только на запись:
+            # itogovaya карта прикладывается к разбору попытки, и молча не сохраниться
+            # она не имеет права.
+            if np is not None:
+                ok, буфер = cv2.imencode(os.path.splitext(args.save)[1] or ".png", кадр)
+                if ok:
+                    буфер.tofile(args.save)
+            else:
+                ok = cv2.imwrite(args.save, кадр)
+            print("[карта] %s: %s" % ("сохранено" if ok else "СОХРАНИТЬ НЕ УДАЛОСЬ",
+                                      args.save))
         if not args.headless and cv2 is not None:
             cv2.destroyAllWindows()
         transport.stop()
