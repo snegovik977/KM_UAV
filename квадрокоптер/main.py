@@ -95,6 +95,24 @@ def поднять_перцепцию(cfg, state, transport, factory, task, log)
         return None, None
 
 
+def поднять_наведение(cfg, state, перцепция, log):
+    """Наведение на посадочный знак «H». None, если центрирование выключено или не на
+    чем работать.
+
+    Работает для ЛЮБОЙ подзадачи, в том числе 2.3.1 без детектора станций: сведение
+    над площадкой — часть базовой посадки, а не разведки. Калибровку берёт у конвейера
+    станций, если тот поднялся, иначе поднимает свою — тоже в try/except, чтобы не
+    ронять полёт (посадка вслепую по координатам возврата остаётся).
+    """
+    try:
+        from perception.landing import from_config as наведение_из_конфига
+        калибровка = перцепция.calibration if перцепция is not None else None
+        return наведение_из_конфига(cfg, state, calibration=калибровка, log=log)
+    except Exception as e:
+        log("[main] наведение на площадку не поднялось: %s: %s" % (type(e).__name__, e))
+        return None
+
+
 def наложить_hud(frame, текст):
     """Строка состояния поверх кадра. Дёшево и делается каждый кадр, в отличие
     от инференса: трансляция должна оставаться плавной."""
@@ -197,6 +215,9 @@ def main():
         # ------------------------------------------------------------- перцепция
         factory = MessageFactory(cfg["mission"]["src"])
         перцепция, реестр = поднять_перцепцию(cfg, state, transport, factory, task, log)
+        наведение = поднять_наведение(cfg, state, перцепция, log)
+        if наведение is not None:
+            log("[main] центрирование по посадочному знаку включено")
 
         # --------------------------------------------------------------- миссия
         mission = Mission(flight, transport, cfg, state=state, log=log,
@@ -234,14 +255,24 @@ def main():
             if перцепция is not None and frame is not None:
                 перцепция.process(frame)
 
+            # Знак площадки ищется на фазах возврата и посадки (внутри update() —
+            # проверка состояния). Точку знака кладёт в state, полётный поток сводит
+            # по ней дрон. Дёшево и каждый кадр: центрирование ждёт свежего наблюдения.
+            if наведение is not None and frame is not None:
+                наведение.update(frame)
+
             if frame is not None:
                 if перцепция is not None:
                     # Отрисовка каждый кадр, инференс — раз в every_n: трансляция
                     # обязана оставаться плавной.
                     перцепция.draw(frame)
-                    наложить_hud(frame, "%s  %s" % (state.hud(), перцепция.hud()))
+                    хвост = перцепция.hud()
                 else:
-                    наложить_hud(frame, state.hud())
+                    хвост = ""
+                if наведение is not None:
+                    наведение.draw(frame)
+                    хвост = ("%s  %s" % (хвост, наведение.hud())).strip()
+                наложить_hud(frame, ("%s  %s" % (state.hud(), хвост)).strip())
                 if viewer is not None:
                     try:
                         viewer.imshow(name=имя_потока, frame=frame)

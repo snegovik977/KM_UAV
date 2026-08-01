@@ -29,6 +29,12 @@ tools/check_sdk.py на борту этот файл нужно править �
     PIONEER_MOCK_VIDEO=путь.mp4     кадры из видеофайла вместо синтетики
     PIONEER_MOCK_STATIONS="1,1.5,ok; -1.2,.5,dust"   расстановка станций, метры, наша СК
     PIONEER_MOCK_STATION_SIZE=0.35x0.5               габариты станции, м
+    PIONEER_MOCK_PAD="0.25,-0.2"       посадочный знак «H» в точке (x, y) нашей СК.
+                                       Смещение от нуля имитирует увод локальной СК за
+                                       облёт: возврат в (0,0) промахивается, и видно,
+                                       как центрирование сводит дрон на знак. Не задан —
+                                       знак не рисуется, посадка идёт вслепую
+    PIONEER_MOCK_PAD_SIZE=0.25         радиус знака, м
 """
 from __future__ import annotations
 
@@ -318,6 +324,13 @@ class MockPioneer(object):
 
 ЯРКОСТЬ_ПОЛА = 205                 # светлый пол, панель на нём — тёмное пятно
 
+# Посадочный знак «H»: насыщенно-жёлтое кольцо с серединой и буквой (см. landing_site.jpg).
+# Жёлтый выбран так, чтобы попасть в HSV-диапазон детектора (landing.* в config.yaml):
+# BGR (20, 210, 235) — это тон ~27 по OpenCV, насыщенный и яркий.
+ЖЁЛТЫЙ_ЗНАКА = (20, 210, 235)
+СЕРЕДИНА_ЗНАКА = (150, 150, 150)   # серая заливка внутри кольца, как на настоящем знаке
+РАДИУС_ЗНАКА = 0.25                # м, если не задан PIONEER_MOCK_PAD_SIZE
+
 # Как выглядит каждый статус. Признаки те же, по которым его определяет
 # perception/status.py (docs/DRONE_PLAN.md §3.2): пыль поднимает яркость и убивает
 # видимость линий ячеек, поломка рвёт контур.
@@ -363,7 +376,7 @@ class MockCamera(object):
     # Фактическое разрешение борта: get_cv_frame() отдаёт (720, 1080, 3), uint8, BGR
     # (проверено check_sdk.py 31.07.2026).
     def __init__(self, camera_type=CameraType.MAIN, width=1080, height=720, fps=15.0,
-                 stations=None, cfg=None):
+                 stations=None, cfg=None, pad=None):
         if camera_type == CameraType.OPT:
             raise RuntimeError("CameraType.OPT открывать нельзя: это камера оптического "
                                "потока позиционирования")
@@ -383,6 +396,12 @@ class MockCamera(object):
             self.stations = list(СТАНЦИИ_ПО_УМОЛЧАНИЮ)
         self.station_size = self._размер_станции()
 
+        # Посадочный знак. По умолчанию НЕ рисуется: без него прогон совпадает с прежним
+        # поведением (и станционные тесты не видят лишнего жёлтого пятна). Включается
+        # аргументом pad=(x, y) или PIONEER_MOCK_PAD="x,y".
+        self.pad = pad if pad is not None else self._площадка_из_окружения()
+        self.pad_radius = _env_float("PIONEER_MOCK_PAD_SIZE", РАДИУС_ЗНАКА)
+
         self._калибровка = None
         self._оси = None
         self._настроить_оптику(cfg)
@@ -393,6 +412,18 @@ class MockCamera(object):
             if not self._video.isOpened():
                 print("[mock] видео %s не открылось — работаю на синтетике" % путь)
                 self._video = None
+
+    @staticmethod
+    def _площадка_из_окружения():
+        текст = os.environ.get("PIONEER_MOCK_PAD")
+        if not текст:
+            return None
+        части = [ч.strip() for ч in текст.split(",")]
+        try:
+            return (float(части[0]), float(части[1]))
+        except (IndexError, ValueError):
+            print("[mock] не понял PIONEER_MOCK_PAD=%r — знак не рисую" % текст)
+            return None
 
     @staticmethod
     def _размер_станции():
@@ -458,6 +489,11 @@ class MockCamera(object):
         if поза is None or cv2 is None or self._калибровка is None:
             return frame
 
+        # Знак рисуется ПЕРВЫМ: на настоящей площадке станции стоят поверх покрытия,
+        # а знак — часть покрытия. Порядок важен, только если они перекроются.
+        if self.pad is not None:
+            self._нарисовать_площадку(frame, поза, self.pad[0], self.pad[1])
+
         for x, y, статус in self.stations:
             self._нарисовать_станцию(frame, поза, x, y, статус)
 
@@ -479,6 +515,38 @@ class MockCamera(object):
                 return None
             готово.append((int(round(пиксель[0])), int(round(пиксель[1]))))
         return готово
+
+    def _круг_на_земле(self, поза, cx, cy, радиус, точек=32):
+        """Пиксели проекции наземной окружности. None, если хоть одна точка не на земле.
+        Наклон камеры превращает круг в эллипс — рисуем именно проекцию, той же честной
+        моделью, что и станции, чтобы центр знака в кадре совпадал с наземной точкой."""
+        точки = [(cx + радиус * math.cos(2 * math.pi * i / точек),
+                  cy + радиус * math.sin(2 * math.pi * i / точек))
+                 for i in range(точек)]
+        return self._в_пиксели(поза, точки)
+
+    def _нарисовать_площадку(self, frame, поза, cx, cy):
+        """Посадочный знак «H»: жёлтое кольцо, серая середина, жёлтая буква. Центр
+        всех трёх — наземная точка (cx, cy), по ней и сводится центрирование."""
+        R = self.pad_radius
+        кольцо = self._круг_на_земле(поза, cx, cy, R)
+        if кольцо is None:
+            return                       # знак не проецируется на землю — вне кадра
+        cv2.fillPoly(frame, [np.array(кольцо, dtype=np.int32)], ЖЁЛТЫЙ_ЗНАКА)
+        середина = self._круг_на_земле(поза, cx, cy, 0.72 * R)
+        if середина is not None:
+            cv2.fillPoly(frame, [np.array(середина, dtype=np.int32)], СЕРЕДИНА_ЗНАКА)
+
+        # Буква «H»: две стойки и перекладина, каждая — наземный прямоугольник.
+        def прямоугольник(x0, y0, x1, y1):
+            углы = self._в_пиксели(поза, [(cx + x0, cy + y0), (cx + x1, cy + y0),
+                                          (cx + x1, cy + y1), (cx + x0, cy + y1)])
+            if углы is not None:
+                cv2.fillPoly(frame, [np.array(углы, dtype=np.int32)], ЖЁЛТЫЙ_ЗНАКА)
+
+        прямоугольник(-0.34 * R, -0.5 * R, -0.14 * R, 0.5 * R)   # левая стойка
+        прямоугольник(0.14 * R, -0.5 * R, 0.34 * R, 0.5 * R)     # правая стойка
+        прямоугольник(-0.34 * R, -0.1 * R, 0.34 * R, 0.1 * R)    # перекладина
 
     def _нарисовать_станцию(self, frame, поза, cx, cy, статус):
         вид = ВИД_СТАНЦИИ.get(статус, ВИД_СТАНЦИИ["ok"])

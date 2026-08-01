@@ -75,6 +75,12 @@ class MissionState(object):
         self.waypoint = 0
         self.waypoints_total = 0
         self.stations = 0                  # пункт 2: сколько станций подтверждено
+        # Посадочный знак «H»: его точка на земле в СК дрона (pad) и время наблюдения
+        # (pad_ts). Наполняет поток перцепции (perception/landing.py), читает полётный
+        # поток при центрировании перед посадкой. None — знак ещё не найден.
+        self.pad = None
+        self.pad_ts = 0.0
+        self.pad_score = 0.0
         self.abort_reason = None
         self.started = None
         self.finished = None
@@ -97,6 +103,9 @@ class MissionState(object):
                 "waypoint": self.waypoint,
                 "waypoints_total": self.waypoints_total,
                 "stations": self.stations,
+                "pad": self.pad,
+                "pad_ts": self.pad_ts,
+                "pad_score": self.pad_score,
                 "abort_reason": self.abort_reason,
                 "elapsed": (time.time() - self.started) if self.started else 0.0,
             }
@@ -139,6 +148,21 @@ class Mission(object):
         self.batt_low = float(cfg["flight"]["batt_low"])
         self.batt_critical = float(cfg["flight"]["batt_critical"])
         self.h_survey = float(cfg["flight"]["h_survey"])
+
+        # Центрирование по посадочному знаку перед спуском. Точку знака кладёт в
+        # состояние поток перцепции (perception/landing.py); здесь только сведение над
+        # ней. Секция может отсутствовать (старые конфиги) — тогда садимся вслепую.
+        landing = cfg.get("landing", {}) or {}
+        self.landing_enabled = bool(landing.get("enabled", False))
+        self.landing = {
+            "center_height": float(landing.get("center_height", self.h_survey)),
+            "tol": float(landing.get("tol", 0.10)),
+            "gain": float(landing.get("gain", 0.9)),
+            "max_steps": int(landing.get("max_steps", 6)),
+            "step_timeout": float(landing.get("step_timeout", 6.0)),
+            "acquire_timeout": float(landing.get("acquire_timeout", 4.0)),
+            "fresh": float(landing.get("fresh", 1.5)),
+        }
 
         self._stop = threading.Event()
         self._state_started = time.time()
@@ -339,14 +363,86 @@ class Mission(object):
     def _land(self):
         """Посадка на площадку — 2 балла подзадачи 2.3.1.
 
-        Пока садимся по координатам точки взлёта. Доводка по зрению (детекция
-        площадки «H» + П-регулятор) — пункт 1.5 плана, встраивается сюда же, когда
-        появится перцепция.
+        Перед вертикальным спуском дрон сводит себя над знаком «H» по зрению
+        (_center_over_pad): возврат приводит его в точку взлёта, но оптопоток за облёт
+        успевает увести локальную СК, и без доводки «сел в пределах площадки» держится
+        на волоске. Не увидели знак — садимся по координатам возврата, как раньше.
         """
         self._set_state(LAND)
+        self._center_over_pad()
         self.flight.land()
         self._set_state(DISARM)
         self.flight.disarm()
+
+    def _center_over_pad(self):
+        """Свести дрон над посадочным знаком «H» до вертикального спуска.
+
+        Точку знака на земле (в СК дрона) кладёт в состояние поток перцепции. Здесь —
+        П-регулятор: подвинуться на долю gain текущей ошибки, взять свежее наблюдение,
+        повторить. Знак в СК дрона неподвижен, поэтому сходимость быстрая; gain<1 и
+        предел шагов гасят раскачку от дрожания центра между кадрами.
+
+        Ветвь целиком необязательная: выключенное центрирование, отсутствие камеры или
+        незахваченный знак означают возврат к посадке вслепую, а не аварию.
+        """
+        if not self.landing_enabled:
+            return
+        параметры = self.landing
+        # Спуск на высоту центрирования: знак крупнее в кадре и точнее ловится.
+        # Держим x, y — их-то и будем доводить.
+        позиция = self.flight.position()
+        if позиция is not None:
+            self.flight.goto(позиция[0], позиция[1], параметры["center_height"],
+                             on_tick=self._tick)
+
+        if not self._await_pad(параметры["acquire_timeout"]):
+            self._log("[миссия] посадочный знак не найден за %.1f с — сажусь по "
+                      "координатам возврата" % параметры["acquire_timeout"])
+            return
+
+        for шаг in range(1, параметры["max_steps"] + 1):
+            цель = self._fresh_pad(параметры["fresh"])
+            позиция = self.flight.position()
+            if цель is None or позиция is None:
+                self._log("[миссия] знак потерян на шаге %d — заканчиваю центрирование"
+                          % шаг)
+                break
+            ошибка = math.hypot(цель[0] - позиция[0], цель[1] - позиция[1])
+            if ошибка <= параметры["tol"]:
+                self._log("[миссия] над знаком: ошибка %.2f м <= %.2f м, спускаюсь"
+                          % (ошибка, параметры["tol"]))
+                return
+            # Шаг П-регулятора: доводим на долю ошибки, а не сразу в цель, — центр знака
+            # между кадрами дрожит, и полный шаг раскачивал бы дрон вокруг площадки.
+            цель_x = позиция[0] + параметры["gain"] * (цель[0] - позиция[0])
+            цель_y = позиция[1] + параметры["gain"] * (цель[1] - позиция[1])
+            self._log("[миссия] центрирование %d/%d: ошибка %.2f м -> правлю"
+                      % (шаг, параметры["max_steps"], ошибка))
+            self.flight.goto(цель_x, цель_y, параметры["center_height"],
+                             timeout=параметры["step_timeout"], on_tick=self._tick)
+        else:
+            self._log("[миссия] предел шагов центрирования исчерпан — спускаюсь как есть")
+
+    def _await_pad(self, timeout):
+        """Дождаться первого свежего наблюдения знака. Во время ожидания продолжаем
+        такты миссии: телеметрия идёт, аварийные условия проверяются."""
+        дедлайн = time.time() + timeout
+        while time.time() < дедлайн:
+            if self._fresh_pad(self.landing["fresh"]) is not None:
+                return True
+            self._tick()
+            time.sleep(0.1)
+        return False
+
+    def _fresh_pad(self, fresh):
+        """Точка знака (x, y) в СК дрона, если наблюдение не старше fresh секунд, иначе
+        None: устаревшее наблюдение неактуально — дрон с тех пор сместился."""
+        s = self.state.snapshot()
+        if s["pad"] is None:
+            return None
+        if time.time() - s["pad_ts"] > fresh:
+            return None
+        return s["pad"]
 
     # ------------------------------------------------------------------ выполнение
 
