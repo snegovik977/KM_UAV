@@ -23,7 +23,7 @@ tests/test_landing.py, но наглядно и с настройкой пара
 проверяется логика и геометрия, а не точность оптики — её даёт только рулетка под
 дроном (см. RUN.md и CLAUDE.md, раздел про заглушку камеры).
 
-Запуск:
+Запуск (заглушка):
     python3 tools/check_landing.py                       # сводка по нескольким смещениям
     python3 tools/check_landing.py --pad 0.3,-0.25       # одно смещение
     python3 tools/check_landing.py --height 1.2 --save кадр.png   # сохранить кадр
@@ -32,6 +32,27 @@ tests/test_landing.py, но наглядно и с настройкой пара
 
 Код возврата 0, если все промахи уложились в допуск landing.tol (+запас), иначе 1 —
 чтобы проверку можно было гонять как регрессионную.
+
+--------------------------------------------------------------------------------
+ЖИВАЯ ПРОВЕРКА НА БОРТУ БЕЗ ЗАПУСКА МОТОРОВ (--live)
+--------------------------------------------------------------------------------
+Отдельно проверяет ту же ветку на НАСТОЯЩЕЙ камере и настоящем знаке, но БЕЗ ПОЛЁТА:
+дрон стоит (или его держат в руке) камерой вниз над площадкой, а программа в реальном
+времени показывает, находит ли детектор жёлтый знак и куда и на сколько дрон стал бы
+доводиться. Ни arm(), ни takeoff(), ни land() — моторы НЕ включаются: создание объекта
+Pioneer винты не крутит, крутит их только arm(), а его здесь нет.
+
+Это и есть способ закрыть главное «НЕ ПРОВЕРЕНО» ветки — пороги цвета landing.* под
+реальную краску знака (заглушка рисует и считает одними числами, реальный цвет не
+проверяет). Наведи камеру на знак, подвигай дрон рукой и смотри, держится ли захват.
+
+    python3 tools/check_landing.py --live                # камера вниз, поток на :8889
+    python3 tools/check_landing.py --live --height 1.2   # если дальномер молчит — задать высоту руками
+    python3 tools/check_landing.py --live --seconds 120  # ограничить время (0 = до Ctrl+C)
+
+Высота берётся с нижнего дальномера (get_dist_sensor_data), без него — из --height.
+Смотреть удобнее в видеопотоке http://172.17.49.2:8889/video: знак обведён, выведен
+вектор доводки «вперёд/влево, см».
 """
 from __future__ import annotations
 
@@ -203,6 +224,169 @@ def проверка_сведения(cfg, калибровка, детекто�
     return промах, строка
 
 
+# ------------------------------------------------- живая проверка без моторов
+
+def _открыть_sdk():
+    """Камера, тип, трансляция и сервопривод — настоящие или из заглушки (PIONEER_MOCK).
+    Ровно как в квадрокоптер/main.py: на борту и на ноутбуке один и тот же код."""
+    if os.environ.get("PIONEER_MOCK"):
+        from mock_pioneer import Camera, CameraType, ImageViewer, ServoCamera
+    else:
+        from pioneer_sdk2 import Camera, CameraType, ImageViewer, ServoCamera
+    return Camera, CameraType, ImageViewer, ServoCamera
+
+
+def проверка_вживую(cfg, калибровка, детектор, seconds, height_override, log):
+    """Настоящая камера + знак, но БЕЗ ПОЛЁТА. Показывает захват знака и вектор доводки.
+
+    Моторы не включаются: тут нет ни arm(), ни takeoff(), ни land() — только чтение
+    камеры, дальномера и ориентации. Создание Pioneer винты не крутит.
+    """
+    from flight import Flight, create_pioneer
+    from localization import Pose, pixel_to_ground
+
+    try:
+        import cv2
+    except ImportError:
+        cv2 = None
+
+    Camera, CameraType, ImageViewer, ServoCamera = _открыть_sdk()
+    имя_потока = str(cfg["camera"]["viewer_name"])
+    таймаут_кадра = float(cfg["camera"]["frame_timeout"])
+    h_min = float(cfg["flight"]["h_min"])
+    допуск = float(cfg["landing"]["tol"])
+
+    pioneer = create_pioneer(log=log)
+    flight = Flight(pioneer, cfg, log=log)     # НЕ вооружаем — только сенсоры
+    камера = viewer = None
+    захватов = кадров = 0
+    log("[live] БЕЗ МОТОРОВ: arm/takeoff/land не вызываются. Держи дрон камерой вниз "
+        "над знаком; Ctrl+C — выход.")
+    try:
+        # Сервопривод — не двигатель: он опускает камеру к земле, без него знак не в кадре.
+        try:
+            угол = int(cfg["camera"]["servo_angle"])
+            ServoCamera().set_angle(угол)
+            log("[live] камера опущена на %d°" % угол)
+        except Exception as e:
+            log("[live] сервопривод не отработал: %s: %s" % (type(e).__name__, e))
+        камера = Camera(camera_type=CameraType.MAIN)
+        viewer = ImageViewer()
+
+        дедлайн = (time.time() + seconds) if seconds > 0 else None
+        печать = 0.0
+        while дедлайн is None or time.time() < дедлайн:
+            try:
+                frame = камера.get_cv_frame(timeout=таймаут_кадра)
+            except Exception as e:
+                log("[live] нет кадра: %s: %s" % (type(e).__name__, e))
+                time.sleep(0.2)
+                continue
+            if frame is None:
+                time.sleep(0.05)
+                continue
+            кадров += 1
+
+            # Высота: дальномер, иначе заданная руками. Без высоты луч на землю не
+            # спроецировать — покажем только пиксель знака.
+            высота = height_override if height_override else flight.range_down()
+            ориентация = flight.orientation() or (0.0, 0.0, 0.0)
+            roll, pitch, _ = калибровка.fix_attitude(*ориентация)
+
+            детекция = детектор.detect(frame)
+            строка = None
+            if детекция is None:
+                строка = "знак не виден"
+            elif высота is None or высота <= 0.05:
+                строка = ("знак в пикселе (%.0f,%.0f), но высота неизвестна — задай "
+                          "--height" % (детекция.cx, детекция.cy))
+            else:
+                поза = Pose(0.0, 0.0, float(высота), roll, pitch, 0.0)
+                точка = pixel_to_ground(детекция.cx, детекция.cy, поза,
+                                        калибровка.intrinsics, калибровка.r_mount)
+                if точка is None:
+                    строка = "знак виден, но луч не встретил землю (наклон/высота)"
+                else:
+                    захватов += 1
+                    dist = math.hypot(точка[0], точка[1])
+                    в_допуске = "В ДОПУСКЕ" if dist <= допуск else "доводка"
+                    строка = ("знак: вперёд %+.2f м, влево %+.2f м  (%.0f см, %s)  h=%.2f м"
+                              % (точка[0], точка[1], 100.0 * dist, в_допуске, высота))
+                    _наложить_вектор(frame, детекция, точка, dist <= допуск, cv2)
+
+            if детекция is not None:
+                _обвести_знак(frame, детекция, cv2)
+            _подпись(frame, "LIVE (без моторов)  " + (строка or ""), cv2)
+            if viewer is not None:
+                try:
+                    viewer.imshow(name=имя_потока, frame=frame)
+                except Exception:
+                    pass
+
+            # Печать не чаще 2 Гц, чтобы не залить консоль; поток остаётся плавным.
+            if time.time() - печать > 0.5:
+                log("[live] " + (строка or ""))
+                печать = time.time()
+    except KeyboardInterrupt:
+        log("\n[live] остановлено оператором")
+    finally:
+        # Никакого disarm/land: моторы не запускались. Только освобождаем камеру —
+        # иначе следующий запуск не откроет shared memory.
+        for объект, метод in ((камера, "stop"), (viewer, "close")):
+            if объект is not None:
+                try:
+                    getattr(объект, метод)()
+                except Exception:
+                    pass
+        try:
+            pioneer.close_connection()
+        except Exception:
+            pass
+
+    log("\nкадров %d, знак захвачен на %d из них" % (кадров, захватов))
+    if кадров and захватов == 0:
+        log("знак ни разу не локализован. Если он в кадре — подвинуть пороги landing.* "
+            "(цвет/площадь) в config.yaml и/или задать --height. См. RUN.md")
+        return 1
+    return 0
+
+
+def _обвести_знак(frame, детекция, cv2):
+    if frame is None or cv2 is None:
+        return
+    try:
+        центр = (int(детекция.cx), int(детекция.cy))
+        cv2.circle(frame, центр, int(детекция.radius), (0, 255, 255), 2)
+        cv2.drawMarker(frame, центр, (0, 255, 255), cv2.MARKER_CROSS, 18, 2)
+    except Exception:
+        pass
+
+
+def _наложить_вектор(frame, детекция, точка, в_допуске, cv2):
+    """Стрелка от центра кадра к знаку: наглядно, куда пошёл бы дрон."""
+    if frame is None or cv2 is None:
+        return
+    try:
+        высота_кадра, ширина_кадра = frame.shape[:2]
+        начало = (ширина_кадра // 2, высота_кадра // 2)
+        конец = (int(детекция.cx), int(детекция.cy))
+        цвет = (80, 220, 80) if в_допуске else (0, 165, 255)
+        cv2.arrowedLine(frame, начало, конец, цвет, 2, tipLength=0.2)
+    except Exception:
+        pass
+
+
+def _подпись(frame, текст, cv2):
+    if frame is None or cv2 is None:
+        return
+    try:
+        cv2.rectangle(frame, (0, 0), (frame.shape[1], 26), (0, 0, 0), -1)
+        cv2.putText(frame, текст, (8, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
+                    (255, 255, 255), 1, cv2.LINE_AA)
+    except Exception:
+        pass
+
+
 # ------------------------------------------------------------------------ main
 
 def main():
@@ -217,6 +401,11 @@ def main():
                         help="сохранить кадр статической проверки с найденным знаком в файл")
     parser.add_argument("--no-flight", action="store_true",
                         help="только статика (детектор+локализация), без прогона миссии")
+    parser.add_argument("--live", action="store_true",
+                        help="живая проверка на настоящей камере БЕЗ ЗАПУСКА МОТОРОВ: "
+                             "детекция знака и вектор доводки в реальном времени")
+    parser.add_argument("--seconds", type=float, default=0.0,
+                        help="ограничить --live по времени, с (0 = до Ctrl+C)")
     args = parser.parse_args()
 
     try:
@@ -235,6 +424,12 @@ def main():
               "Проверяю логику всё равно.")
     калибровка = калибровка_из_конфига(cfg, log=lambda _: None)
     детектор = детектор_из(cfg, log=lambda _: None)
+
+    if args.live:
+        # Живая проверка на настоящей камере, без моторов. Свой поток исполнения:
+        # ни статики, ни миссии, ни кода возврата по допуску.
+        return проверка_вживую(cfg, калибровка, детектор, args.seconds, args.height,
+                               log=print)
 
     допуск = float(cfg["landing"]["tol"])
     height = args.height if args.height is not None else float(cfg["landing"]["center_height"])

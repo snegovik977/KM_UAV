@@ -197,6 +197,8 @@ python3 tools/diag_model.py --model stations            # НА БОРТУ: по�
 python tools/check_landing.py                           # сводка: детекция + сведение
 python tools/check_landing.py --pad 0.3,-0.25 --save кадр.png   # одно смещение, кадр
 python tools/check_landing.py --no-flight               # только детекция и локализация
+python tools/check_landing.py --live                    # НА БОРТУ, БЕЗ МОТОРОВ: реальная
+                                                        # камера и знак, вектор доводки в потоке :8889
 ```
 
 `--manual` (взлёт без пакета) — **только отладка**: на зачётной попытке 3 балла из 5 дают именно за старт по команде от передатчика.
