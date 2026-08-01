@@ -1,0 +1,312 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""Проверка центрирования по посадочному знаку «H» — БЕЗ ДРОНА И ПОЛИГОНА.
+
+Отдельная программа под ветку центрирования (perception/landing.py + Mission._center_over_pad):
+её задача — на одном экране показать, что цепочка «кадр -> детектор знака -> центр ->
+точка на земле -> сведение дрона» работает и с какой точностью. То же, что делают
+tests/test_landing.py, но наглядно и с настройкой параметров из командной строки —
+чтобы подбирать пороги landing.* по config.yaml, не запуская pytest.
+
+Две проверки, обе на заглушке (регламент 1.3: время утекает и на простое полигона):
+
+  СТАТИКА   один кадр: знак рисуется honest-моделью в точке pad, детектор его находит,
+            центр проецируется ОБРАТНО на землю. Печатается ошибка локализации в см —
+            это и есть «на сколько дрон промахнётся мимо знака». Кадр с найденным
+            знаком можно сохранить (--save) и посмотреть глазами.
+  СВЕДЕНИЕ  полная миссия на заглушке: знак смещён от нуля (имитирует увод локальной СК
+            за облёт), поток перцепции кормит LandingGuide, полётный автомат сводит
+            дрон над знаком. Печатается итоговая точка посадки и промах.
+
+⚠️ Чего проверка НЕ ловит (как и весь мок): заглушка рисует знак теми же интринсиками
+и R_mount, которыми потом считает, поэтому ЛЮБАЯ калибровка выглядит идеальной. Здесь
+проверяется логика и геометрия, а не точность оптики — её даёт только рулетка под
+дроном (см. RUN.md и CLAUDE.md, раздел про заглушку камеры).
+
+Запуск:
+    python3 tools/check_landing.py                       # сводка по нескольким смещениям
+    python3 tools/check_landing.py --pad 0.3,-0.25       # одно смещение
+    python3 tools/check_landing.py --height 1.2 --save кадр.png   # сохранить кадр
+    python3 tools/check_landing.py --no-flight           # только статика, без миссии
+    python3 tools/check_landing.py --config путь/config.yaml
+
+Код возврата 0, если все промахи уложились в допуск landing.tol (+запас), иначе 1 —
+чтобы проверку можно было гонять как регрессионную.
+"""
+from __future__ import annotations
+
+import argparse
+import math
+import os
+import sys
+import threading
+import time
+
+# Консоль Windows по умолчанию не в UTF-8 и роняет вывод кириллицы. На борту и на
+# платформе заочного этапа это Linux/UTF-8, там переключение — no-op. Без эмодзи в
+# печати обходимся намеренно: не всякий терминал их кодирует.
+try:
+    sys.stdout.reconfigure(encoding="utf-8")
+except Exception:
+    pass
+
+_ЗДЕСЬ = os.path.dirname(os.path.abspath(__file__))
+_КОРЕНЬ = os.path.dirname(_ЗДЕСЬ)
+for _путь in (_ЗДЕСЬ, _КОРЕНЬ, os.path.join(_КОРЕНЬ, "квадрокоптер"),
+              os.path.join(_КОРЕНЬ, "распределительный хаб")):
+    if os.path.isdir(_путь) and _путь not in sys.path:
+        sys.path.insert(0, _путь)
+
+# Смещения знака от точки взлёта по умолчанию, метры (наша СК: X вперёд, Y влево).
+# Ноль — знак ровно под точкой возврата (центрировать нечего, но детектор обязан
+# найти); остальные — правдоподобный увод локальной СК за облёт в разные стороны.
+СМЕЩЕНИЯ_ПО_УМОЛЧАНИЮ = ((0.0, 0.0), (0.30, -0.25), (-0.35, 0.30), (0.15, 0.40))
+
+
+def разобрать_смещение(текст):
+    части = [ч.strip() for ч in текст.split(",")]
+    if len(части) != 2:
+        raise argparse.ArgumentTypeError("смещение задаётся как X,Y, например 0.3,-0.25")
+    try:
+        return (float(части[0]), float(части[1]))
+    except ValueError:
+        raise argparse.ArgumentTypeError("смещение %r — не пара чисел" % текст)
+
+
+def детектор_из(cfg, log):
+    from perception.landing import LandingPadDetector
+
+    раздел = cfg["landing"]
+    return LandingPadDetector(
+        hue_lo=раздел["hue_lo"], hue_hi=раздел["hue_hi"], sat_min=раздел["sat_min"],
+        val_min=раздел["val_min"], close_px=раздел["close_px"],
+        min_area_px=раздел["min_area_px"], min_fill=раздел["min_fill"], log=log)
+
+
+# --------------------------------------------------------------------- статика
+
+# Доля кадра у края, в которой знак считается «частично за кадром»: minEnclosingCircle
+# по обрезанному кольцу смещает центр, и одиночный снимок такому знаку верить не должен —
+# как раз поэтому центрирование итеративное, а локализация берёт центральные 50 % кадра.
+_ПОЛЕ_КРАЯ = 0.04
+
+
+def статическая_проверка(cfg, калибровка, детектор, pad, height, save=None):
+    """Один кадр: найти знак и вернуть ошибку локализации его центра, метры.
+
+    Возвращает (ошибка_м | None, у_края, строка). None — знак не найден; у_края True —
+    знак прижат к границе кадра и обрезан, ошибке одиночного снимка верить нельзя.
+    """
+    from localization import Pose, pixel_to_ground
+    from mock_pioneer import MockCamera
+
+    поза = Pose(0.0, 0.0, float(height), 0.0, 0.0, 0.0)
+    камера = MockCamera(fps=1e6, stations=[], cfg=cfg, pad=pad)
+    камера.pose = lambda: поза
+    кадр = камера._синтетика()
+    высота_кадра, ширина_кадра = кадр.shape[:2]
+
+    детекция = детектор.detect(кадр)
+    if детекция is None:
+        return None, False, ("pad=(%+.2f,%+.2f) h=%.1f  ЗНАК НЕ НАЙДЕН"
+                             % (pad[0], pad[1], height))
+
+    точка = pixel_to_ground(детекция.cx, детекция.cy, поза,
+                            калибровка.intrinsics, калибровка.r_mount)
+    if точка is None:
+        return None, False, ("pad=(%+.2f,%+.2f) h=%.1f  центр не спроецировался на землю"
+                             % (pad[0], pad[1], height))
+
+    у_края = (детекция.cx < _ПОЛЕ_КРАЯ * ширина_кадра
+              or детекция.cx > (1 - _ПОЛЕ_КРАЯ) * ширина_кадра
+              or детекция.cy < _ПОЛЕ_КРАЯ * высота_кадра
+              or детекция.cy > (1 - _ПОЛЕ_КРАЯ) * высота_кадра)
+    ошибка = math.hypot(точка[0] - pad[0], точка[1] - pad[1])
+    строка = ("pad=(%+.2f,%+.2f) h=%.1f  центр в пикселях (%.0f,%.0f) заполнение %.0f%%  "
+              "-> земля (%+.3f,%+.3f)  ошибка %.1f см"
+              % (pad[0], pad[1], height, детекция.cx, детекция.cy, 100.0 * детекция.score,
+                 точка[0], точка[1], 100.0 * ошибка))
+
+    if save:
+        _сохранить_кадр(кадр, детекция, save)
+        строка += "  [кадр -> %s]" % save
+    return ошибка, у_края, строка
+
+
+def _сохранить_кадр(кадр, детекция, path):
+    try:
+        import cv2
+
+        центр = (int(детекция.cx), int(детекция.cy))
+        cv2.circle(кадр, центр, int(детекция.radius), (0, 255, 255), 2)
+        cv2.drawMarker(кадр, центр, (0, 255, 255), cv2.MARKER_CROSS, 20, 2)
+        cv2.imwrite(path, кадр)
+    except Exception as e:
+        print("не удалось сохранить кадр: %s: %s" % (type(e).__name__, e))
+
+
+# -------------------------------------------------------------------- сведение
+
+def _ускорить(cfg):
+    """Урезать тайминги: это проверка, а не полёт. Пороги детектора не трогаем."""
+    cfg["flight"]["arm_settle"] = 0.05
+    cfg["flight"]["takeoff_settle"] = 0.05
+    cfg["flight"]["settle"] = 0.02
+    cfg["flight"]["point_timeout"] = 3.0
+    cfg["mission"]["manual_start"] = True
+    cfg["mission"]["telemetry_hz"] = 20.0
+    cfg["loop"]["length"] = 1.0
+    cfg["loop"]["width"] = 1.0
+    return cfg
+
+
+def проверка_сведения(cfg, калибровка, детектор, pad):
+    """Полная миссия на заглушке со знаком в точке pad. Возвращает (промах_м, строка)."""
+    from flight import Flight
+    from mission import LAND, RETURN, Mission, MissionState
+    from mock_pioneer import MockCamera, MockPioneer
+    from perception.landing import LandingGuide
+    from tasks import TaskProfile
+
+    pioneer = MockPioneer(speed=6.0)          # станет _последним_дроном для камеры
+    state = MissionState()
+    flight = Flight(pioneer, cfg, log=lambda _: None)
+    mission = Mission(flight, None, cfg, state=state, log=lambda _: None,
+                      task=TaskProfile("2.3.1"))
+
+    камера = MockCamera(fps=60.0, stations=[], cfg=cfg, pad=pad)
+    гид = LandingGuide(детектор, калибровка, state, phases=(RETURN, LAND),
+                       log=lambda _: None)
+
+    стоп = threading.Event()
+
+    def перцепция():
+        while not стоп.is_set():
+            гид.update(камера._синтетика())
+            time.sleep(0.01)
+
+    поток = threading.Thread(target=перцепция, daemon=True)
+    поток.start()
+    try:
+        mission.run()
+    finally:
+        стоп.set()
+        поток.join(timeout=2.0)
+
+    x, y, _ = flight.position()
+    промах = math.hypot(x - pad[0], y - pad[1])
+    авария = state.snapshot()["abort_reason"]
+    строка = ("pad=(%+.2f,%+.2f)  сел в (%+.3f,%+.3f)  промах %.1f см  захватов знака %d"
+              % (pad[0], pad[1], x, y, 100.0 * промах, гид.hits))
+    if авария:
+        строка += "  АВАРИЯ: %s" % авария
+    return промах, строка
+
+
+# ------------------------------------------------------------------------ main
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Проверка центрирования по посадочному знаку без дрона")
+    parser.add_argument("--config", default=None, help="путь к config.yaml")
+    parser.add_argument("--pad", type=разобрать_смещение, default=None,
+                        help="одно смещение знака X,Y (иначе прогон по набору)")
+    parser.add_argument("--height", type=float, default=None,
+                        help="высота для статической проверки, м (по умолчанию landing.center_height)")
+    parser.add_argument("--save", default=None,
+                        help="сохранить кадр статической проверки с найденным знаком в файл")
+    parser.add_argument("--no-flight", action="store_true",
+                        help="только статика (детектор+локализация), без прогона миссии")
+    args = parser.parse_args()
+
+    try:
+        import numpy  # noqa: F401
+        import cv2     # noqa: F401
+    except ImportError as e:
+        print("Нужны numpy и cv2 (%s). Проверка работает только там, где они есть." % e)
+        return 2
+
+    import config as config_module
+    from perception.calib import from_config as калибровка_из_конфига
+
+    cfg = config_module.load(args.config)
+    if not cfg.get("landing", {}).get("enabled", False):
+        print("ВНИМАНИЕ: landing.enabled=false в конфиге — в бою центрирование ВЫКЛЮЧЕНО. "
+              "Проверяю логику всё равно.")
+    калибровка = калибровка_из_конфига(cfg, log=lambda _: None)
+    детектор = детектор_из(cfg, log=lambda _: None)
+
+    допуск = float(cfg["landing"]["tol"])
+    height = args.height if args.height is not None else float(cfg["landing"]["center_height"])
+    смещения = [args.pad] if args.pad is not None else list(СМЕЩЕНИЯ_ПО_УМОЛЧАНИЮ)
+
+    print("=" * 78)
+    print("ПРОВЕРКА ЦЕНТРИРОВАНИЯ ПО ПОСАДОЧНОМУ ЗНАКУ (заглушка, без дрона)")
+    print("калибровка: %s" % калибровка)
+    if not калибровка.measured:
+        print("  (!) интринсики НЕ ИЗМЕРЕНЫ — заглушка рисует и считает одними числами, "
+              "точность здесь всегда идеальна. Реальную проверяет только рулетка.")
+    print("допуск landing.tol = %.0f см, высота статики = %.1f м" % (100.0 * допуск, height))
+    print("=" * 78)
+
+    # Статика — диагностика точности локализации, не приговор: знак у края кадра
+    # одиночным снимком локализуется хуже (кольцо обрезано), и именно поэтому
+    # центрирование итеративное. ИТОГ считаем по сведению — это и есть проверяемая ветка.
+    ошибки_в_центре = []
+    не_найдено = 0
+
+    print("\n[1] СТАТИКА: кадр -> детектор -> центр -> точка на земле (диагностика)")
+    for i, pad in enumerate(смещения):
+        сохранить = args.save if (args.save and (args.pad is not None or i == 0)) else None
+        ошибка, у_края, строка = статическая_проверка(cfg, калибровка, детектор, pad,
+                                                      height, save=сохранить)
+        if ошибка is None:
+            метка = "  ЗНАК НЕ НАЙДЕН"
+            не_найдено += 1
+        elif у_края:
+            метка = "  (знак у края кадра — одиночному снимку не верим, сводит полёт)"
+        elif ошибка <= допуск:
+            метка = "  ok"
+            ошибки_в_центре.append(ошибка)
+        else:
+            метка = "  ВЕЛИКА для знака в центре кадра"
+            ошибки_в_центре.append(ошибка)
+        print("  " + строка + метка)
+
+    провалов = 0
+    if not args.no_flight:
+        print("\n[2] СВЕДЕНИЕ: полная миссия на заглушке, дрон сводится над знаком")
+        # Урезаем тайминги: это проверка логики, а не полёт. Пороги детектора и
+        # калибровку (уже прочитаны выше) правка не трогает.
+        _ускорить(cfg)
+        for pad in смещения:
+            промах, строка = проверка_сведения(cfg, калибровка, детектор, pad)
+            # Запас к допуску: последний шаг П-регулятора не доводит ровно в ноль,
+            # плюс дискретность кадров. 5 см сверх tol — тот же порог, что в тесте.
+            порог = допуск + 0.05
+            метка = "  ok" if промах <= порог else "  ПРОВАЛ"
+            print("  " + строка + метка)
+            if промах > порог:
+                провалов += 1
+
+    print("\n" + "=" * 78)
+    if ошибки_в_центре:
+        print("локализация знака в центре кадра: макс %.1f см, средняя %.1f см"
+              % (100.0 * max(ошибки_в_центре),
+                 100.0 * (sum(ошибки_в_центре) / len(ошибки_в_центре))))
+    if не_найдено:
+        print("знак не найден в %d статических кадрах — проверить пороги landing.* (цвет!)"
+              % не_найдено)
+    if args.no_flight:
+        print("ИТОГ: статика пройдена (сведение пропущено ключом --no-flight)")
+        return 1 if не_найдено else 0
+    if провалов == 0:
+        print("ИТОГ: дрон свёлся над знаком во всех прогонах, в допуске — OK")
+        return 0
+    print("ИТОГ: провалов сведения — %d FAIL (подобрать landing.* в config.yaml, RUN.md)"
+          % провалов)
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

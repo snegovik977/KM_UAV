@@ -24,7 +24,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 | `беспилотный автомобиль/` | Чужой трек; пока только README со входом в общий протокол |
 | `launch.py` | Пульт: ssh-ключ, заливка на борт, запуск хаба, визуализатора и дрона, команда на взлёт — одной командой (см. `RUN.md` §0) |
 | `tests/` | pytest, дрона и сети не требуют |
-| `tools/` | `check_sdk.py`, `check_axes.py`, `diag_model.py` — диагностика борта; `record.py` — запись попыток; `replay.py` — прогон перцепции по записи; `calibrate_camera.py` — интринсики; `eval_detection.py` — mAP и confusion matrix |
+| `tools/` | `check_sdk.py`, `check_axes.py`, `diag_model.py` — диагностика борта; `record.py` — запись попыток; `replay.py` — прогон перцепции по записи; `calibrate_camera.py` — интринсики; `eval_detection.py` — mAP и confusion matrix; `check_landing.py` — центрирование по посадочному знаку на заглушке |
 | `RUN.md` | Что запускать и в каком порядке; таблица «если не работает». Первое, что читать перед полигоном |
 | `docs/REGLAMENT.md` | Дословная транскрипция официального PDF. Опечатки оригинала помечены `[sic]` и сносками. **Свои выводы сюда не дописывать** |
 | `docs/NOTES.md` | Разбор регламента: сумма баллов, приоритеты, ловушки, разбор задачи заочного этапа |
@@ -192,6 +192,11 @@ python tools/calibrate_camera.py --grab кадры/          # снять шах
 python tools/calibrate_camera.py кадры/                 # -> готовый блок для config.yaml
 python tools/eval_detection.py кадры/ разметка/         # mAP + confusion matrix
 python3 tools/diag_model.py --model stations            # НА БОРТУ: почему детекций ноль
+
+# ЦЕНТРИРОВАНИЕ ПО ПОСАДОЧНОМУ ЗНАКУ (на заглушке, без дрона; см. perception/landing.py)
+python tools/check_landing.py                           # сводка: детекция + сведение
+python tools/check_landing.py --pad 0.3,-0.25 --save кадр.png   # одно смещение, кадр
+python tools/check_landing.py --no-flight               # только детекция и локализация
 ```
 
 `--manual` (взлёт без пакета) — **только отладка**: на зачётной попытке 3 балла из 5 дают именно за старт по команде от передатчика.
