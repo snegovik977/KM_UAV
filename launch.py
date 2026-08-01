@@ -173,7 +173,8 @@ def план_заливки(корень=КОРЕНЬ, конфиг=True):
         (sorted(glob.glob(os.path.join(корень, "распределительный хаб", "protocol", "*.py"))),
          "protocol"),
         ([os.path.join(корень, "tools", имя)
-          for имя in ("record.py", "check_sdk.py", "check_axes.py")], "tools"),
+          for имя in ("record.py", "check_sdk.py", "check_axes.py",
+                      "check_landing.py")], "tools"),
     ]
     if конфиг:
         группы.insert(1, ([os.path.join(корень, "квадрокоптер", "config.yaml")], ""))
