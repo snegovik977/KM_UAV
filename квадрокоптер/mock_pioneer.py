@@ -27,6 +27,8 @@ tools/check_sdk.py на борту этот файл нужно править �
     PIONEER_MOCK_STUCK=1            перелёты никогда не завершаются (проверка таймаутов)
     PIONEER_MOCK_NAV_FAIL=25        через N секунд полёта срывается оптопоток
     PIONEER_MOCK_VIDEO=путь.mp4     кадры из видеофайла вместо синтетики
+    PIONEER_MOCK_STATIONS="1,1.5,ok; -1.2,.5,dust"   расстановка станций, метры, наша СК
+    PIONEER_MOCK_STATION_SIZE=0.35x0.5               габариты станции, м
 """
 from __future__ import annotations
 
@@ -302,21 +304,66 @@ class MockPioneer(object):
         return True
 
 
+# Расстановка станций по умолчанию: (x, y, статус) в НАШЕЙ СК, метры от точки взлёта.
+# Это декорация тестового стенда, а не константа алгоритма: в боевом коде таких
+# координат быть не может (регламент 2.5). Точки лежат вдоль контура из config.yaml,
+# чтобы облёт по умолчанию реально проносил их под камерой.
+СТАНЦИИ_ПО_УМОЛЧАНИЮ = ((1.2, 0.8, "ok"), (1.2, -0.8, "dust"),
+                        (-1.4, 0.9, "broken"), (-1.4, -0.7, "ok"))
+
+# Габариты станции. Реальный размер НЕ ИЗМЕРЕН — уточнить у организаторов
+# (docs/DRONE_PLAN.md, приложение Г). Пороги детектора в config.yaml обязаны
+# бракетировать это значение, а не совпадать с ним.
+РАЗМЕР_СТАНЦИИ = (0.35, 0.50)      # (вдоль X, вдоль Y), м
+
+ЯРКОСТЬ_ПОЛА = 205                 # светлый пол, панель на нём — тёмное пятно
+
+# Как выглядит каждый статус. Признаки те же, по которым его определяет
+# perception/status.py (docs/DRONE_PLAN.md §3.2): пыль поднимает яркость и убивает
+# видимость линий ячеек, поломка рвёт контур.
+ВИД_СТАНЦИИ = {
+    "ok":     {"цвет": (62, 54, 46), "ячейки": True, "разлом": False},
+    "dust":   {"цвет": (150, 152, 150), "ячейки": False, "разлом": False},
+    "broken": {"цвет": (58, 52, 48), "ячейки": True, "разлом": True},
+}
+
+
+def _разобрать_станции(текст):
+    """"x,y,статус; x,y,статус" -> список кортежей. Кривую запись пропускаем с шумом."""
+    станции = []
+    for кусок in текст.replace("\n", ";").split(";"):
+        кусок = кусок.strip()
+        if not кусок:
+            continue
+        части = [ч.strip() for ч in кусок.split(",")]
+        try:
+            x, y = float(части[0]), float(части[1])
+        except (IndexError, ValueError):
+            print("[mock] не понял описание станции %r — пропускаю" % кусок)
+            continue
+        статус = части[2] if len(части) > 2 and части[2] in ВИД_СТАНЦИИ else "ok"
+        станции.append((x, y, статус))
+    return станции
+
+
 class MockCamera(object):
     """Кадры без камеры: видеофайл, если он задан, иначе синтетика по позе дрона.
 
-    Синтетика не декоративная: на «полу» нарисованы станции, и по мере движения дрона
-    они проезжают через кадр. Этого хватает, чтобы прогнать поток перцепции, запись
-    и трансляцию до того, как появится реальное видео.
-    """
+    Синтетика рисуется ТОЙ ЖЕ дырочной моделью, которой локализация считает координаты
+    (localization.ground_to_pixel), только обратной, и с интринсиками из config.yaml.
+    Это принципиально: так сквозной прогон «мок -> детектор -> локализация -> реестр»
+    проверяет прямую формулу против обратной и меряет фактическую ошибку в метрах —
+    то есть критерий «<30 см» подзадачи 2.3.2 проверяется без полигона.
 
-    # Станции на «полигоне», в СК автопилота заглушки. Не константы алгоритма,
-    # а декорация тестового стенда — в боевом коде таких координат быть не может.
-    СТАНЦИИ = [(1.0, 1.5), (-1.2, 2.5), (0.4, 4.0), (2.0, 3.2)]
+    Чего заглушка по-прежнему НЕ ловит: неверные интринсики и R_mount. Она рисует теми же
+    числами, которыми потом считает, поэтому любая калибровка выглядит идеальной.
+    Настоящую проверку даёт только рулетка под дроном.
+    """
 
     # Фактическое разрешение борта: get_cv_frame() отдаёт (720, 1080, 3), uint8, BGR
     # (проверено check_sdk.py 31.07.2026).
-    def __init__(self, camera_type=CameraType.MAIN, width=1080, height=720, fps=15.0):
+    def __init__(self, camera_type=CameraType.MAIN, width=1080, height=720, fps=15.0,
+                 stations=None, cfg=None):
         if camera_type == CameraType.OPT:
             raise RuntimeError("CameraType.OPT открывать нельзя: это камера оптического "
                                "потока позиционирования")
@@ -326,12 +373,54 @@ class MockCamera(object):
         self.stopped = False
         self.frames = 0
         self._video = None
+
+        описание = os.environ.get("PIONEER_MOCK_STATIONS")
+        if stations is not None:
+            self.stations = list(stations)
+        elif описание:
+            self.stations = _разобрать_станции(описание)
+        else:
+            self.stations = list(СТАНЦИИ_ПО_УМОЛЧАНИЮ)
+        self.station_size = self._размер_станции()
+
+        self._калибровка = None
+        self._оси = None
+        self._настроить_оптику(cfg)
+
         путь = os.environ.get("PIONEER_MOCK_VIDEO")
         if путь and cv2 is not None:
             self._video = cv2.VideoCapture(путь)
             if not self._video.isOpened():
                 print("[mock] видео %s не открылось — работаю на синтетике" % путь)
                 self._video = None
+
+    @staticmethod
+    def _размер_станции():
+        текст = os.environ.get("PIONEER_MOCK_STATION_SIZE")
+        if not текст:
+            return РАЗМЕР_СТАНЦИИ
+        try:
+            вдоль_x, вдоль_y = (float(ч) for ч in текст.lower().split("x"))
+            return (вдоль_x, вдоль_y)
+        except ValueError:
+            print("[mock] не понял PIONEER_MOCK_STATION_SIZE=%r, беру %s"
+                  % (текст, РАЗМЕР_СТАНЦИИ))
+            return РАЗМЕР_СТАНЦИИ
+
+    def _настроить_оптику(self, cfg):
+        """Калибровка и адаптер осей из config.yaml. Не вышло — рисуем без станций:
+        заглушка не имеет права ронять прогон, ради которого она существует."""
+        try:
+            import config as config_module
+            from flight import AxisAdapter
+            from perception.calib import from_config as калибровка_из_конфига
+
+            cfg = cfg if cfg is not None else config_module.load()
+            self._калибровка = калибровка_из_конфига(cfg, log=lambda _: None)
+            self._оси = AxisAdapter.from_config(cfg)
+        except Exception as e:
+            print("[mock] оптика не настроена (%s: %s) — станции рисоваться не будут"
+                  % (type(e).__name__, e))
 
     def get_cv_frame(self, timeout=5.0):
         if self.stopped:
@@ -347,29 +436,86 @@ class MockCamera(object):
                 return frame
         return self._синтетика()
 
+    # ------------------------------------------------------------------ синтетика
+
+    def pose(self):
+        """Поза дрона в НАШЕЙ СК. Заглушка автопилота хранит её в СК автопилота —
+        в той же, в которой приняла команду, — поэтому пересчёт обязателен."""
+        from localization import Pose
+
+        дрон = _последний_дрон
+        if дрон is None or self._оси is None:
+            return None
+        x, y, z = self._оси.from_sdk(*дрон.get_local_position_lps())
+        yaw = self._оси.yaw_from_sdk(дрон.get_orientation()[2])
+        return Pose(x, y, max(z, 0.05), 0.0, 0.0, yaw)
+
     def _синтетика(self):
         if np is None:
             return None
-        frame = np.full((self.height, self.width, 3), 210, dtype=np.uint8)
-        дрон = _последний_дрон
-        if дрон is None or cv2 is None:
+        frame = np.full((self.height, self.width, 3), ЯРКОСТЬ_ПОЛА, dtype=np.uint8)
+        поза = self.pose()
+        if поза is None or cv2 is None or self._калибровка is None:
             return frame
 
-        x, y, z = дрон.get_local_position_lps()
-        z = max(z, 0.3)
-        # Грубая проекция «пол -> кадр»: пикселей на метр при надирной камере.
-        масштаб = self.width / (2.0 * z * math.tan(math.radians(30.0)))
+        for x, y, статус in self.stations:
+            self._нарисовать_станцию(frame, поза, x, y, статус)
 
-        for сx, сy in self.СТАНЦИИ:
-            u = int(self.width / 2 + (сx - x) * масштаб)
-            v = int(self.height / 2 - (сy - y) * масштаб)
-            размер = max(4, int(0.4 * масштаб))
-            if -размер < u < self.width + размер and -размер < v < self.height + размер:
-                cv2.rectangle(frame, (u - размер, v - размер // 2),
-                              (u + размер, v + размер // 2), (60, 55, 50), -1)
-        cv2.putText(frame, "MOCK x=%+.2f y=%+.2f z=%.2f" % (x, y, z),
-                    (10, self.height - 12), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1)
+        # Подписи на кадре намеренно НЕТ: у настоящей камеры её тоже нет, а детектор
+        # честно ловил бы тёмные буквы как объект. Поза и состояние миссии наносятся
+        # поверх позже, в main.py, уже после инференса.
         return frame
+
+    def _в_пиксели(self, поза, точки):
+        """Точки земли -> пиксели. None, если хоть одна не проецируется."""
+        from localization import ground_to_pixel
+
+        калибровка = self._калибровка
+        готово = []
+        for x, y in точки:
+            пиксель = ground_to_pixel(x, y, поза, калибровка.intrinsics,
+                                      калибровка.r_mount)
+            if пиксель is None:
+                return None
+            готово.append((int(round(пиксель[0])), int(round(пиксель[1]))))
+        return готово
+
+    def _нарисовать_станцию(self, frame, поза, cx, cy, статус):
+        вид = ВИД_СТАНЦИИ.get(статус, ВИД_СТАНЦИИ["ok"])
+        половина_x, половина_y = self.station_size[0] / 2.0, self.station_size[1] / 2.0
+        углы = self._в_пиксели(поза, [
+            (cx - половина_x, cy - половина_y), (cx + половина_x, cy - половина_y),
+            (cx + половина_x, cy + половина_y), (cx - половина_x, cy + половина_y)])
+        if углы is None:
+            return
+        # Целиком за кадром — не тратим время на отрисовку.
+        запас = max(self.width, self.height)
+        if all(u < -запас or u > self.width + запас or
+               v < -запас or v > self.height + запас for u, v in углы):
+            return
+
+        cv2.fillPoly(frame, [np.array(углы, dtype=np.int32)], вид["цвет"])
+
+        if вид["ячейки"]:
+            # Линии между фотоэлементами: по ним и отличается «покрыта пылью»
+            # (пыль их замыливает, дисперсия лапласиана падает).
+            светлее = tuple(min(255, c + 45) for c in вид["цвет"])
+            for доля in (0.25, 0.5, 0.75):
+                y_линии = cy - половина_y + 2 * половина_y * доля
+                отрезок = self._в_пиксели(поза, [(cx - половина_x, y_линии),
+                                                 (cx + половина_x, y_линии)])
+                if отрезок:
+                    cv2.line(frame, отрезок[0], отрезок[1], светлее, 1, cv2.LINE_AA)
+
+        if вид["разлом"]:
+            # Неисправная станция: угол выломан, контур перестаёт быть прямоугольным.
+            выломанный = self._в_пиксели(поза, [
+                (cx + половина_x, cy + половина_y),
+                (cx + половина_x - половина_x, cy + половина_y),
+                (cx + половина_x, cy + половина_y - половина_y)])
+            if выломанный:
+                cv2.fillPoly(frame, [np.array(выломанный, dtype=np.int32)],
+                             (ЯРКОСТЬ_ПОЛА, ЯРКОСТЬ_ПОЛА, ЯРКОСТЬ_ПОЛА))
 
     def stop(self):
         self.stopped = True

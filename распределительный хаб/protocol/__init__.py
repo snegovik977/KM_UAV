@@ -28,10 +28,12 @@ from .messages import (  # noqa: F401
     parse,
     validate,
 )
+from .legacy import MapAnchor, to_legacy  # noqa: F401
 from .transport import HttpTransport  # noqa: F401
 
 __all__ = [
     "MISSION_STATES", "PROTOCOL_VERSION", "SOURCES", "STATUSES", "TYPES",
+    "MapAnchor", "to_legacy",
     "MessageFactory", "ProtocolError", "SeqDedup", "HttpTransport",
     "dumps", "make", "make_recon_done", "make_station_new", "make_status_update",
     "make_takeoff", "make_telemetry", "parse", "validate",

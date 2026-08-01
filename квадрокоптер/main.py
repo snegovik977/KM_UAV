@@ -44,8 +44,9 @@ for _путь in (_ЗДЕСЬ,
         sys.path.insert(0, _путь)
 
 import config as config_module            # noqa: E402
+import tasks as tasks_module              # noqa: E402
 from flight import Flight, create_pioneer  # noqa: E402
-from mission import Mission, MissionState  # noqa: E402
+from mission import Mission, MissionState, SURVEY  # noqa: E402
 from protocol import HttpTransport, MessageFactory  # noqa: E402
 from record import RecordWriter           # noqa: E402
 
@@ -62,6 +63,36 @@ def открыть_sdk(log):
     else:
         from pioneer_sdk2 import Camera, CameraType, ImageViewer, ServoCamera
     return Camera, CameraType, ImageViewer, ServoCamera
+
+
+def поднять_перцепцию(cfg, state, transport, factory, task, log):
+    """Детектор, калибровка и реестр станций. None, если задача детекции не требует.
+
+    Всё в try/except: перцепция не имеет права ронять полёт (docs/DRONE_PLAN.md §1.3).
+    Не поднялась — дрон всё равно взлетает, облетает территорию и садится, то есть
+    3 + 2 балла подзадачи 2.3.1 остаются на месте.
+    """
+    if not task.detect:
+        return None, None
+    try:
+        from fusion import StationRegistry
+        from perception.calib import from_config as калибровка_из_конфига
+        from perception.detector import create_detector
+        from perception.pipeline import Perception
+
+        калибровка = калибровка_из_конфига(cfg, log=log)
+        детектор = create_detector(cfg, log=log)
+        реестр = StationRegistry(cfg, transport=transport, factory=factory,
+                                 state=state, task=task, log=log)
+        перцепция = Perception(cfg, state, реестр, калибровка, детектор, log=log)
+        перцепция.check(cfg["flight"]["h_survey"])
+        return перцепция, реестр
+    except Exception as e:
+        log("[main] ПЕРЦЕПЦИЯ НЕ ПОДНЯЛАСЬ: %s: %s" % (type(e).__name__, e))
+        log("[main] полёт продолжится без детекции — станции найдены не будут")
+        import traceback
+        traceback.print_exc()
+        return None, None
 
 
 def наложить_hud(frame, текст):
@@ -81,6 +112,10 @@ def наложить_hud(frame, текст):
 def main():
     parser = argparse.ArgumentParser(description="Бортовое ПО квадрокоптера (2.3.1)")
     parser.add_argument("--config", default=None, help="путь к config.yaml")
+    parser.add_argument("--task", default=None,
+                        help="подзадача регламента: %s (или 1..4). "
+                             "Перекрывает mission.task в конфиге"
+                             % ", ".join(tasks_module.NAMES))
     parser.add_argument("--hub", default=None, help="адрес хаба (перекрывает конфиг)")
     parser.add_argument("--manual", action="store_true",
                         help="взлетать не дожидаясь пакета takeoff")
@@ -92,6 +127,12 @@ def main():
 
     log = print
     cfg = config_module.load(args.config)
+    try:
+        task = tasks_module.from_config(cfg, args.task)
+    except tasks_module.UnknownTask as e:
+        print("[main] %s" % e)
+        return 1
+    log("[main] подзадача %s" % task)
     if args.hub:
         cfg["hub"]["url"] = args.hub
     if args.manual:
@@ -106,6 +147,7 @@ def main():
     pioneer = camera = viewer = None
     transport = recorder = None
     mission = flight = None
+    перцепция = реестр = None
     поток_миссии = None
     state = MissionState()
 
@@ -152,9 +194,13 @@ def main():
             recorder = RecordWriter(out_dir=str(cfg["mission"]["record_dir"]),
                                     fps=float(cfg["mission"]["record_fps"]), log=log)
 
+        # ------------------------------------------------------------- перцепция
+        factory = MessageFactory(cfg["mission"]["src"])
+        перцепция, реестр = поднять_перцепцию(cfg, state, transport, factory, task, log)
+
         # --------------------------------------------------------------- миссия
         mission = Mission(flight, transport, cfg, state=state, log=log,
-                          factory=MessageFactory(cfg["mission"]["src"]))
+                          factory=factory, task=task, registry=реестр)
         поток_миссии = threading.Thread(target=mission.run, name="mission", daemon=True)
         поток_миссии.start()
         log("[main] поток миссии запущен, главный поток — перцепция")
@@ -183,11 +229,19 @@ def main():
                         log("[перцепция] нет кадра (%d-я ошибка): %s: %s"
                             % (ошибки, type(e).__name__, e))
 
-            # ЗДЕСЬ в пункте 2 плана появится инференс. Он обязан быть в try/except:
-            # перцепция не имеет права ронять полёт.
+            # Инференс. Внутри всё в try/except и с прореживанием ошибок: перцепция
+            # не имеет права ронять полёт (docs/DRONE_PLAN.md §1.3).
+            if перцепция is not None and frame is not None:
+                перцепция.process(frame)
 
             if frame is not None:
-                наложить_hud(frame, state.hud())
+                if перцепция is not None:
+                    # Отрисовка каждый кадр, инференс — раз в every_n: трансляция
+                    # обязана оставаться плавной.
+                    перцепция.draw(frame)
+                    наложить_hud(frame, "%s  %s" % (state.hud(), перцепция.hud()))
+                else:
+                    наложить_hud(frame, state.hud())
                 if viewer is not None:
                     try:
                         viewer.imshow(name=имя_потока, frame=frame)
@@ -207,6 +261,13 @@ def main():
 
         поток_миссии.join(timeout=5.0)
         log("[main] миссия завершена: %s" % state.hud())
+        if перцепция is not None:
+            log(перцепция.summary())
+            log(реестр.summary())
+            for станция in реестр.snapshot():
+                log("[main] %s: x=%+.2f y=%+.2f %s (набл. %d)"
+                    % (станция["id"], станция["x"], станция["y"],
+                       станция["status"], станция["n_obs"]))
 
     except KeyboardInterrupt:
         log("\n[main] прервано оператором (Ctrl+C)")

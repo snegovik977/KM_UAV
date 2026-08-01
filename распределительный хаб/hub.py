@@ -32,22 +32,88 @@ import argparse
 import io
 import json
 import os
+import queue
 import sys
 import threading
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+from protocol.legacy import MapAnchor, to_legacy  # noqa: E402
 from protocol.messages import ProtocolError, STATUSES, parse  # noqa: E402
 
 DEFAULT_PORT = 5001          # порт из примеров организаторов
+
+
+class LegacyForwarder(object):
+    """Мост наружу: дублирует наши пакеты в текстовом формате примера организаторов.
+
+    Нужен ровно на один случай: если на площадке визуализатор пишет смежный трек
+    по присланному организаторами шаблону (source/2_step/MapExample.py), он ждёт
+    POST /fly с телом "x,y" в пикселях и POST /eyecar с "Good"/"Broken", а нашего
+    JSON не понимает. Восемь баллов подзадачи 2.3.2 требуют работающего визуализатора,
+    и упереться в несовпадение форматов на площадке дороже, чем держать этот мост.
+
+    По умолчанию ВЫКЛЮЧЕН: хаб обязан оставаться тупым ретранслятором, а лишний
+    исходящий HTTP на несуществующий адрес — это задержки в потоке приёма.
+    Отправка идёт в отдельном потоке и ошибки только считает.
+    """
+
+    def __init__(self, url, anchor, log=None):
+        self.url = url.rstrip("/")
+        self.anchor = anchor
+        self._log = log or (lambda text: print(text))
+        self.sent = 0
+        self.errors = 0
+        self._queue = queue.Queue(maxsize=200)
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._loop, name="legacy-forward",
+                                        daemon=True)
+        self._thread.start()
+
+    def offer(self, msg):
+        """Поставить пакет в очередь. Не блокирует: переполненную очередь роняем —
+        мост вторичен, приём пакетов важнее."""
+        for маршрут, тело in to_legacy(msg, self.anchor):
+            try:
+                self._queue.put_nowait((маршрут, тело))
+            except queue.Full:
+                self.errors += 1
+
+    def _loop(self):
+        from urllib import error, request
+
+        while not self._stop.is_set():
+            try:
+                маршрут, тело = self._queue.get(timeout=0.2)
+            except queue.Empty:
+                continue
+            запрос = request.Request(self.url + маршрут,
+                                     data=тело.encode("utf-8"), method="POST")
+            запрос.add_header("Content-Type", "text/plain; charset=utf-8")
+            try:
+                request.urlopen(запрос, timeout=1.0).read()
+                self.sent += 1
+            except (error.URLError, OSError) as e:
+                self.errors += 1
+                if self.errors % 20 == 1:
+                    self._log("[мост] %s не принял (%d-я ошибка): %s"
+                              % (self.url, self.errors, e))
+
+    def stop(self):
+        self._stop.set()
+        self._thread.join(timeout=1.0)
+
+    def summary(self):
+        return "[мост] на %s отправлено %d, ошибок %d" % (self.url, self.sent, self.errors)
 
 
 class HubState:
     """Журнал пакетов и производная от него карта. Вся логика хаба — здесь,
     чтобы Flask и http.server оставались тонкими обёртками."""
 
-    def __init__(self, log_path=None):
+    def __init__(self, log_path=None, forwarder=None):
+        self.forwarder = forwarder      # мост в формат организаторов, обычно None
         self._lock = threading.Lock()
         self._log = []                  # все принятые пакеты по порядку
         self._stations = {}             # id -> {id, x, y, status, conf, src, ts}
@@ -79,6 +145,9 @@ class HubState:
             self._apply(msg)
             index = len(self._log)
         self._write_log(msg)
+        if self.forwarder is not None:
+            # Вне замка и без ожидания: мост вторичен, приём пакетов важнее.
+            self.forwarder.offer(msg)
         return 200, {"ok": True, "index": index}
 
     def _apply(self, msg):
@@ -273,9 +342,30 @@ def main():
     parser.add_argument("--log", default="hub_log.jsonl",
                         help="журнал принятых пакетов (пусто — не вести)")
     parser.add_argument("--server", choices=("auto", "flask", "stdlib"), default="auto")
+    parser.add_argument("--forward", default=None, metavar="URL",
+                        help="дублировать пакеты в текстовом формате организаторов "
+                             "(POST /fly, /eyecar) на чужой визуализатор. "
+                             "По умолчанию выключено")
+    parser.add_argument("--config", default=None,
+                        help="config.yaml — из него берётся привязка карты для --forward")
     args = parser.parse_args()
 
-    state = HubState(log_path=args.log or None)
+    forwarder = None
+    if args.forward:
+        # Привязка «метры -> пиксели карты» нужна только мосту: наш собственный
+        # визуализатор берёт её сам и в метрах не теряется.
+        cfg = {}
+        try:
+            sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                            os.pardir, "квадрокоптер"))
+            import config as config_module
+            cfg = config_module.load(args.config)
+        except Exception as e:
+            print("[мост] config.yaml не прочитан (%s) — привязка карты по умолчанию" % e)
+        forwarder = LegacyForwarder(args.forward, MapAnchor.from_config(cfg))
+        print("[мост] дублирую станции в текстовом формате на %s" % args.forward)
+
+    state = HubState(log_path=args.log or None, forwarder=forwarder)
 
     use_flask = args.server == "flask"
     if args.server == "auto":
@@ -298,6 +388,9 @@ def main():
         snapshot = state.snapshot()
         print("[hub] принято пакетов: %d, станций в карте: %d"
               % (snapshot["messages"], snapshot["count"]))
+        if forwarder is not None:
+            print(forwarder.summary())
+            forwarder.stop()
         state.close()
 
 

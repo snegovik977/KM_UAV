@@ -16,6 +16,7 @@ import config as config_module
 from flight import Flight
 from mission import AbortMission, Mission, MissionState
 from mock_pioneer import MockPioneer
+from tasks import TaskProfile
 
 
 def настройки(зона=2.0, правки=None):
@@ -41,11 +42,12 @@ def настройки(зона=2.0, правки=None):
     return cfg
 
 
-def собрать(cfg, transport=None, **аргументы_дрона):
+def собрать(cfg, transport=None, task=None, **аргументы_дрона):
     pioneer = MockPioneer(speed=5.0, **аргументы_дрона)
     state = MissionState()
     flight = Flight(pioneer, cfg, log=lambda text: None)
-    mission = Mission(flight, transport, cfg, state=state, log=lambda text: None)
+    mission = Mission(flight, transport, cfg, state=state, log=lambda text: None,
+                      task=TaskProfile(task) if task else None)
     return pioneer, mission, state
 
 
@@ -332,15 +334,16 @@ def test_пакет_не_меняет_трассу_по_умолчанию():
     assert ширина == pytest.approx(2.0)
 
 
-def test_recon_done_не_уходит_без_станций():
-    """Пункт 1 станций ещё не ищет. Пустой recon_done заставил бы автомобиль
-    строить маршрут по пустой карте."""
+def test_recon_done_не_уходит_в_подзадаче_231():
+    """Подзадача 2.3.1 разведки не ведёт: recon_done из неё не имеет смысла и
+    заставил бы автомобиль строить маршрут по пустой карте."""
     from protocol import MessageFactory
 
     cfg = настройки()
     transport = ЗаписнойТранспорт()
-    pioneer, mission, state = собрать(cfg, transport=transport)
+    pioneer, mission, state = собрать(cfg, transport=transport, task="2.3.1")
     mission.factory = MessageFactory("drone")
+    state.update(stations=3)          # даже если реестр каким-то образом наполнился
     mission.run()
     assert not [m for m in transport.отправленные if m["type"] == "recon_done"]
 
@@ -351,16 +354,15 @@ def test_recon_done_уходит_после_облёта():
 
     cfg = настройки()
     transport = ЗаписнойТранспорт()
-    pioneer, mission, state = собрать(cfg, transport=transport)
+    pioneer, mission, state = собрать(cfg, transport=transport, task="2.3.2")
     mission.factory = MessageFactory("drone")
     исходный = mission._survey
 
     def облёт_с_находками():
-        # Реестр станций появится в пункте 2 плана; здесь подставляем его результат,
-        # чтобы проверить сам порядок: recon_done строго после всей змейки.
-        исходный()
+        # Реестр наполняет поток перцепции по ходу облёта; здесь подставляем его
+        # результат, чтобы проверить сам порядок: recon_done строго после всей змейки.
         state.update(stations=3)
-        mission._after_survey()
+        исходный()
 
     mission._survey = облёт_с_находками
     mission.run()
@@ -368,6 +370,22 @@ def test_recon_done_уходит_после_облёта():
     пакеты = [m for m in transport.отправленные if m["type"] == "recon_done"]
     assert len(пакеты) == 1
     assert пакеты[0]["data"]["count"] == 3
+
+
+def test_recon_done_уходит_и_с_нулём_станций():
+    """Пустая карта — тоже результат разведки. Молчание оставило бы автомобиль
+    ждать сигнала «разведка кончилась» бесконечно."""
+    from protocol import MessageFactory
+
+    cfg = настройки()
+    transport = ЗаписнойТранспорт()
+    pioneer, mission, state = собрать(cfg, transport=transport, task="2.3.2")
+    mission.factory = MessageFactory("drone")
+    mission.run()
+
+    пакеты = [m for m in transport.отправленные if m["type"] == "recon_done"]
+    assert len(пакеты) == 1
+    assert пакеты[0]["data"]["count"] == 0
 
 
 # ------------------------------------------------------------------------ прочее

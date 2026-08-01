@@ -24,11 +24,28 @@ import threading
 import time
 
 from survey import plan_from_config
+from tasks import TaskProfile
 
 # Те же строки, что в протоколе (protocol/messages.py -> MISSION_STATES): состояние
 # уходит в телеметрию, и расхождение здесь означает отвергнутый пакет.
 IDLE, ARM, TAKEOFF, SURVEY, DUST, RETURN, LAND, DISARM, ERROR = (
     "IDLE", "ARM", "TAKEOFF", "SURVEY", "DUST", "RETURN", "LAND", "DISARM", "ERROR")
+
+
+def to_world(x, y, origin):
+    """Из СК дрона в общую СК роя.
+
+    В подзадачах 2.3.x начало общей СК совпадает с точкой взлёта, и origin нулевой.
+    В финале дрон стартует с автомобиля, и момент команды takeoff физически задаёт
+    общее начало отсчёта обеим машинам — тогда сдвиг и поворот приходят в пакете.
+
+    Функция общая для телеметрии и для координат станций намеренно: разойдись эти
+    два пересчёта — и дрон сообщал бы своё положение в одной СК, а станции в другой.
+    """
+    ox, oy, oyaw = origin
+    угол = math.radians(oyaw)
+    return (ox + x * math.cos(угол) - y * math.sin(угол),
+            oy + x * math.sin(угол) + y * math.cos(угол))
 
 
 class AbortMission(Exception):
@@ -47,6 +64,11 @@ class MissionState(object):
         self._lock = threading.Lock()
         self.state = IDLE
         self.position = (0.0, 0.0, 0.0)
+        # Все три угла, а не только курс: локализация станций считает луч камеры
+        # в мировой СК, и крен с тангажом входят в неё наравне с рысканием
+        # (~3.5 см ошибки на градус, docs/DRONE_PLAN.md §2.2).
+        self.roll = 0.0
+        self.pitch = 0.0
         self.yaw = 0.0
         self.battery = 0.0
         self.origin = (0.0, 0.0, 0.0)      # начало общей СК роя из пакета takeoff
@@ -67,6 +89,8 @@ class MissionState(object):
             return {
                 "state": self.state,
                 "position": self.position,
+                "roll": self.roll,
+                "pitch": self.pitch,
                 "yaw": self.yaw,
                 "battery": self.battery,
                 "origin": self.origin,
@@ -89,13 +113,20 @@ class MissionState(object):
 class Mission(object):
     """Полётная логика. Запускается в отдельном потоке, главный поток занят перцепцией."""
 
-    def __init__(self, flight, transport, cfg, state=None, log=None, factory=None):
+    def __init__(self, flight, transport, cfg, state=None, log=None, factory=None,
+                 task=None, registry=None):
         self.flight = flight
         self.transport = transport
         self.cfg = cfg
         self.state = state or MissionState()
         self._log = log or (lambda text: print(text))
         self.factory = factory              # protocol.MessageFactory, может быть None
+        # Профиль подзадачи: он решает, уходят ли наружу пакеты разведки. Без него
+        # (старые тесты, ручной запуск) берётся значение из конфига.
+        self.task = task or TaskProfile(cfg["mission"].get("task", "2.3.1"))
+        # Реестр наполняет поток перцепции; миссии он нужен ровно в одном месте —
+        # чтобы дослать уточнённые координаты перед recon_done. None, если детекции нет.
+        self.registry = registry
 
         mission = cfg["mission"]
         self.manual_start = bool(mission["manual_start"])
@@ -143,7 +174,7 @@ class Mission(object):
         if position is not None:
             поля["position"] = position
         if orientation is not None:
-            поля["yaw"] = orientation[2]
+            поля["roll"], поля["pitch"], поля["yaw"] = orientation
         if battery is not None:
             поля["battery"] = battery
         if поля:
@@ -171,16 +202,7 @@ class Mission(object):
             self._log("[миссия] телеметрия не ушла: %s: %s" % (type(e).__name__, e))
 
     def _to_world(self, x, y):
-        """Из СК дрона в общую СК роя.
-
-        В подзадачах 2.3.x начало общей СК совпадает с точкой взлёта, и origin нулевой.
-        В финале дрон стартует с автомобиля, и момент команды takeoff физически задаёт
-        общее начало отсчёта обеим машинам — тогда сдвиг и поворот приходят в пакете.
-        """
-        ox, oy, oyaw = self.state.snapshot()["origin"]
-        угол = math.radians(oyaw)
-        return (ox + x * math.cos(угол) - y * math.sin(угол),
-                oy + x * math.sin(угол) + y * math.cos(угол))
+        return to_world(x, y, self.state.snapshot()["origin"])
 
     def _check_aborts(self, battery):
         if self._stop.is_set():
@@ -273,17 +295,33 @@ class Mission(object):
         self._after_survey()
 
     def _after_survey(self):
-        """Точка расширения пункта 2: здесь уходит recon_done с числом станций.
+        """Конец разведки: наружу уходит recon_done с числом найденных станций.
 
         Пакет обязан уйти строго после всей змейки, иначе автомобиль начнёт строить
         маршрут по неполной карте.
+
+        Шлём и при нуле станций: для автомобиля recon_done — сигнал «разведка кончилась,
+        можно ехать», и молчание оставило бы его ждать бесконечно. Пустая карта — тоже
+        результат разведки.
         """
+        # Момент самый выгодный для уточнения координат: все наблюдения собраны,
+        # медиана максимально устойчива, а автомобиль ещё не начал строить маршрут.
+        if self.registry is not None:
+            try:
+                уточнено = self.registry.flush()
+                if уточнено:
+                    self._log("[миссия] дослано уточнённых координат: %d" % уточнено)
+            except Exception as e:
+                self._log("[миссия] уточнение координат не удалось: %s: %s"
+                          % (type(e).__name__, e))
+
+        if not self.task.sends_recon_done:
+            return
         if self.transport is None or self.factory is None:
             return
         количество = self.state.snapshot()["stations"]
-        if количество:
-            self.transport.send(self.factory.recon_done(count=количество))
-            self._log("[миссия] recon_done: %d станций" % количество)
+        self.transport.send(self.factory.recon_done(count=количество))
+        self._log("[миссия] recon_done: %d станций" % количество)
 
     def _dust(self):
         """Точка расширения пункта 4: подлёт к запылённой станции и обдув.
